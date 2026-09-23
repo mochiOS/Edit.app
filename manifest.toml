@@ -18,6 +18,7 @@ requires = [
     "ipc.client",
     "window.create",
     "fs.read.user",
+    "fs.write.user",
     "clipboard.read",
     "clipboard.write",
 ]

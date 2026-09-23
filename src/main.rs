@@ -1,6 +1,13 @@
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+mod preferences;
 
+use std::cell::{Cell, RefCell};
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use preferences::EditorPreferences;
 use viewkit::draw_command::DrawCommand;
 use viewkit::event::{EventContext, EventResult, ViewEvent};
 use viewkit::prelude::*;
@@ -9,18 +16,31 @@ use viewkit::view::{Constraints, MeasureContext, PaintContext};
 struct EditApp {
     editor: TextEditorInteractionState,
     document: DocumentIdentity,
+    preferences: EditorPreferenceModel,
+    settings_visible: State<bool>,
+    saved_revision: Rc<Cell<u64>>,
+    save_status: Rc<RefCell<Option<String>>>,
 }
 
 impl App for EditApp {
     type Body = EditView;
 
     fn new() -> Self {
-        let document = DocumentIdentity::from_arguments();
+        let mut document = DocumentIdentity::from_arguments();
         let editor = TextEditorInteractionState::new();
-        if let Some(contents) = document.contents.as_ref() {
-            editor.set_value(contents.clone());
+        if let Some(contents) = document.contents.take() {
+            editor.set_value(contents);
         }
-        Self { editor, document }
+        editor.focus();
+        let preferences = EditorPreferenceModel::load();
+        Self {
+            saved_revision: Rc::new(Cell::new(editor.revision())),
+            editor,
+            document,
+            preferences,
+            settings_visible: State::new(false),
+            save_status: Rc::new(RefCell::new(None)),
+        }
     }
 
     fn window(&self) -> WindowOptions {
@@ -32,8 +52,11 @@ impl App for EditApp {
     fn body(&self, _context: &ViewContext) -> Self::Body {
         EditView::new(
             self.editor.clone(),
-            self.document.file_type,
-            self.document.encoding,
+            self.document.clone(),
+            self.preferences.clone(),
+            self.settings_visible.clone(),
+            self.saved_revision.clone(),
+            self.save_status.clone(),
         )
     }
 }
@@ -44,6 +67,9 @@ struct DocumentIdentity {
     file_type: &'static str,
     encoding: &'static str,
     contents: Option<String>,
+    path: Option<PathBuf>,
+    writes_bom: bool,
+    can_save: bool,
 }
 
 impl DocumentIdentity {
@@ -64,6 +90,9 @@ impl DocumentIdentity {
                 file_type: "Plain Text",
                 encoding: "UTF-8",
                 contents: None,
+                path: None,
+                writes_bom: false,
+                can_save: false,
             };
         };
 
@@ -73,22 +102,76 @@ impl DocumentIdentity {
             .unwrap_or("Untitled")
             .to_owned();
         let file_type = file_type_for_path(&path);
-        let (contents, encoding) = match std::fs::read(&path) {
-            Ok(bytes) if bytes.starts_with(&[0xef, 0xbb, 0xbf]) => (
-                String::from_utf8(bytes[3..].to_vec()).ok(),
-                "UTF-8 with BOM",
-            ),
+        let (contents, encoding, writes_bom, can_save) = match std::fs::read(&path) {
+            Ok(bytes) if bytes.starts_with(&[0xef, 0xbb, 0xbf]) => {
+                match String::from_utf8(bytes[3..].to_vec()) {
+                    Ok(contents) => (Some(contents), "UTF-8 with BOM", true, true),
+                    Err(_) => (None, "Unsupported encoding", false, false),
+                }
+            }
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(contents) => (Some(contents), "UTF-8"),
-                Err(_) => (None, "Unsupported encoding"),
+                Ok(contents) => (Some(contents), "UTF-8", false, true),
+                Err(_) => (None, "Unsupported encoding", false, false),
             },
-            Err(_) => (None, "UTF-8"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                (Some(String::new()), "UTF-8", false, true)
+            }
+            Err(_) => (None, "Unavailable", false, false),
         };
         Self {
             display_name,
             file_type,
             encoding,
             contents,
+            path: Some(path),
+            writes_bom,
+            can_save,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EditorPreferenceModel {
+    line_wrap: State<bool>,
+    show_line_count: State<bool>,
+    font_size: State<f32>,
+    persisted: Rc<RefCell<EditorPreferences>>,
+    save_error: Rc<RefCell<Option<String>>>,
+}
+
+impl EditorPreferenceModel {
+    fn load() -> Self {
+        let preferences = EditorPreferences::load();
+        Self {
+            line_wrap: State::new(preferences.line_wrap),
+            show_line_count: State::new(preferences.show_line_count),
+            font_size: State::new(preferences.font_size),
+            persisted: Rc::new(RefCell::new(preferences)),
+            save_error: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn snapshot(&self) -> EditorPreferences {
+        EditorPreferences {
+            line_wrap: self.line_wrap.get(),
+            show_line_count: self.show_line_count.get(),
+            font_size: self.font_size.get(),
+        }
+    }
+
+    fn persist_if_changed(&self) {
+        let preferences = self.snapshot();
+        if *self.persisted.borrow() == preferences {
+            return;
+        }
+        match preferences.save() {
+            Ok(()) => {
+                *self.persisted.borrow_mut() = preferences;
+                self.save_error.borrow_mut().take();
+            }
+            Err(error) => {
+                *self.save_error.borrow_mut() = Some(format!("Unable to save settings: {error}"));
+            }
         }
     }
 }
@@ -118,6 +201,48 @@ fn file_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+fn save_document(path: &Path, contents: &str, writes_bom: bool) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "document has no parent directory",
+        )
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid document name"))?;
+    let temporary = parent.join(format!(".{name}.edit-{}.new", std::process::id()));
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        if writes_bom {
+            file.write_all(&[0xef, 0xbb, 0xbf])?;
+        }
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        if let Ok(metadata) = fs::metadata(path) {
+            fs::set_permissions(
+                &temporary,
+                fs::Permissions::from_mode(metadata.permissions().mode() & 0o777),
+            )?;
+        }
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
 #[derive(Default)]
 struct FindState {
     visible: bool,
@@ -131,8 +256,12 @@ struct EditView {
     find_field_state: TextFieldInteractionState,
     find_field: TextField,
     find_state: RefCell<FindState>,
-    file_type: &'static str,
-    encoding: &'static str,
+    document: DocumentIdentity,
+    preferences: EditorPreferenceModel,
+    settings_visible: State<bool>,
+    settings: EditSettingsView,
+    saved_revision: Rc<Cell<u64>>,
+    save_status: Rc<RefCell<Option<String>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -147,21 +276,52 @@ struct EditGeometry {
 impl EditView {
     fn new(
         editor_state: TextEditorInteractionState,
-        file_type: &'static str,
-        encoding: &'static str,
+        document: DocumentIdentity,
+        preferences: EditorPreferenceModel,
+        settings_visible: State<bool>,
+        saved_revision: Rc<Cell<u64>>,
+        save_status: Rc<RefCell<Option<String>>>,
     ) -> Self {
         let find_field_state = TextFieldInteractionState::new();
+        let settings = EditSettingsView::new(preferences.clone(), settings_visible.clone());
         Self {
             editor: TextEditor::with_interaction(editor_state.clone())
-                .placeholder("Start typing"),
+                .placeholder("Start typing")
+                .monospaced(true)
+                .line_wrap(preferences.line_wrap.get())
+                .font_size(preferences.font_size.get()),
             editor_state,
             find_field: TextField::with_interaction(find_field_state.clone())
                 .placeholder("Find")
                 .size(TextFieldSize::Small),
             find_field_state,
             find_state: RefCell::new(FindState::default()),
-            file_type,
-            encoding,
+            document,
+            preferences,
+            settings_visible,
+            settings,
+            saved_revision,
+            save_status,
+        }
+    }
+
+    fn save(&self) {
+        let Some(path) = self.document.path.as_deref() else {
+            *self.save_status.borrow_mut() = Some(String::from("Save As is required"));
+            return;
+        };
+        if !self.document.can_save {
+            *self.save_status.borrow_mut() = Some(String::from("This document cannot be saved"));
+            return;
+        }
+        match save_document(path, &self.editor_state.value(), self.document.writes_bom) {
+            Ok(()) => {
+                self.saved_revision.set(self.editor_state.revision());
+                *self.save_status.borrow_mut() = Some(String::from("Saved"));
+            }
+            Err(error) => {
+                *self.save_status.borrow_mut() = Some(format!("Unable to save: {error}"));
+            }
         }
     }
 
@@ -175,12 +335,20 @@ impl EditView {
         );
         let find_visible = self.find_state.borrow().visible;
         let find_height = if find_visible {
-            theme.layout.top_bar_height.min((bounds.size.height - footer_height).max(0.0))
+            theme
+                .layout
+                .top_bar_height
+                .min((bounds.size.height - footer_height).max(0.0))
         } else {
             0.0
         };
         let find_bar = find_visible.then(|| {
-            Rect::new(bounds.origin.x, bounds.origin.y, bounds.size.width, find_height)
+            Rect::new(
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                find_height,
+            )
         });
         let horizontal = theme.spacing.large;
         let field_height = theme.layout.compact_control_height.min(find_height);
@@ -221,9 +389,7 @@ impl EditView {
 
     fn update_find_result(&self, backwards: bool, from_start: bool) {
         let query = self.find_field_state.value();
-        let result = self
-            .editor_state
-            .find_match(&query, backwards, from_start);
+        let result = self.editor_state.find_match(&query, backwards, from_start);
         let mut state = self.find_state.borrow_mut();
         state.last_query = query;
         state.result = result;
@@ -247,6 +413,10 @@ impl View for EditView {
     }
 
     fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
+        if self.settings_visible.get() {
+            self.settings.paint(bounds, context);
+            return;
+        }
         let geometry = self.geometry(bounds, context.theme);
         Rectangle::new()
             .color(RectangleColor::Custom(context.theme.colors.surface))
@@ -258,7 +428,8 @@ impl View for EditView {
                 .color(RectangleColor::Custom(context.theme.colors.surface_subtle))
                 .paint(find_bar, context);
             self.find_field.paint(geometry.find_field, context);
-            let result_bounds = vertically_centered_text(geometry.find_result, TextRole::Caption, context);
+            let result_bounds =
+                vertically_centered_text(geometry.find_result, TextRole::Caption, context);
             Text::metadata(self.find_result_label()).paint(result_bounds, context);
             paint_top_or_bottom_divider(find_bar, false, context);
         }
@@ -269,22 +440,45 @@ impl View for EditView {
         paint_top_or_bottom_divider(geometry.footer, true, context);
 
         let horizontal = context.theme.spacing.large;
-        let footer_text = vertically_centered_text(Rect::new(
-            geometry.footer.origin.x + horizontal,
-            geometry.footer.origin.y,
-            (geometry.footer.size.width - horizontal * 2.0).max(0.0),
-            geometry.footer.size.height,
-        ), TextRole::Caption, context);
-        Text::metadata(self.file_type).paint(footer_text, context);
+        let footer_text = vertically_centered_text(
+            Rect::new(
+                geometry.footer.origin.x + horizontal,
+                geometry.footer.origin.y,
+                (geometry.footer.size.width - horizontal * 2.0).max(0.0),
+                geometry.footer.size.height,
+            ),
+            TextRole::Caption,
+            context,
+        );
+        let mut file_status = self.document.file_type.to_owned();
+        if let Some(status) = self.save_status.borrow().as_ref() {
+            file_status.push_str("    ");
+            file_status.push_str(status);
+        } else if self.editor_state.revision() != self.saved_revision.get() {
+            file_status.push_str("    Edited");
+        }
+        Text::metadata(file_status).paint(footer_text, context);
         let (lines, characters) = self.editor_state.statistics();
-        let line_label = if lines == 1 { "line" } else { "lines" };
-        let character_label = if characters == 1 { "character" } else { "characters" };
-        Text::metadata(format!(
-            "{}    {} {}    {} {}",
-            self.encoding, lines, line_label, characters, character_label
-        ))
-        .alignment(TextAlignment::End)
-        .paint(footer_text, context);
+        let character_label = if characters == 1 {
+            "character"
+        } else {
+            "characters"
+        };
+        let statistics = if self.preferences.show_line_count.get() {
+            let line_label = if lines == 1 { "line" } else { "lines" };
+            format!(
+                "{}    {} {}    {} {}",
+                self.document.encoding, lines, line_label, characters, character_label
+            )
+        } else {
+            format!(
+                "{}    {} {}",
+                self.document.encoding, characters, character_label
+            )
+        };
+        Text::metadata(statistics)
+            .alignment(TextAlignment::End)
+            .paint(footer_text, context);
     }
 
     fn handle_event(
@@ -293,7 +487,64 @@ impl View for EditView {
         event: &ViewEvent,
         context: &mut EventContext<'_>,
     ) -> EventResult {
+        if matches!(
+            event,
+            ViewEvent::KeyPressed {
+                key: Key::Character('q' | 'Q' | 'w' | 'W'),
+                modifiers
+            } if modifiers.shortcut()
+        ) {
+            request_exit();
+            return EventResult::Consumed;
+        }
+
+        if matches!(
+            event,
+            ViewEvent::KeyPressed {
+                key: Key::Character(','),
+                modifiers
+            } if modifiers.shortcut()
+        ) {
+            self.settings_visible.set(!self.settings_visible.get());
+            context.request_redraw();
+            return EventResult::Consumed;
+        }
+
+        if self.settings_visible.get() {
+            if matches!(
+                event,
+                ViewEvent::KeyPressed {
+                    key: Key::Escape,
+                    ..
+                }
+            ) {
+                self.settings_visible.set(false);
+                context.request_redraw();
+                return EventResult::Consumed;
+            }
+            let result = self.settings.handle_event(bounds, event, context);
+            self.preferences.persist_if_changed();
+            return result;
+        }
+
         let geometry = self.geometry(bounds, context.theme());
+        if matches!(event, ViewEvent::FocusChanged { focused: true })
+            && !self.find_state.borrow().visible
+        {
+            context.request_keyboard_focus(geometry.editor);
+        }
+
+        if matches!(
+            event,
+            ViewEvent::KeyPressed {
+                key: Key::Character('s' | 'S'),
+                modifiers
+            } if modifiers.shortcut()
+        ) {
+            self.save();
+            context.request_redraw_in(geometry.footer);
+            return EventResult::Consumed;
+        }
         if matches!(
             event,
             ViewEvent::KeyPressed {
@@ -315,7 +566,13 @@ impl View for EditView {
         }
 
         if self.find_state.borrow().visible
-            && matches!(event, ViewEvent::KeyPressed { key: Key::Escape, .. })
+            && matches!(
+                event,
+                ViewEvent::KeyPressed {
+                    key: Key::Escape,
+                    ..
+                }
+            )
         {
             self.find_state.borrow_mut().visible = false;
             self.find_field_state.set_focused(false);
@@ -339,10 +596,11 @@ impl View for EditView {
         let revision = self.editor_state.revision();
         let mut result = EventResult::Ignored;
         if self.find_state.borrow().visible {
-            result = result.merge(
-                self.find_field
-                    .handle_event(geometry.find_field, event, context),
-            );
+            result = result.merge(self.find_field.handle_event(
+                geometry.find_field,
+                event,
+                context,
+            ));
             let query = self.find_field_state.value();
             if query != self.find_state.borrow().last_query {
                 self.update_find_result(false, true);
@@ -351,9 +609,134 @@ impl View for EditView {
         }
         result = result.merge(self.editor.handle_event(geometry.editor, event, context));
         if self.editor_state.revision() != revision {
+            self.save_status.borrow_mut().take();
             context.request_redraw_in(geometry.footer);
         }
         result
+    }
+}
+
+struct EditSettingsView {
+    page: SettingsPage<FormSections>,
+    done: Button,
+    preferences: EditorPreferenceModel,
+}
+
+impl EditSettingsView {
+    fn new(preferences: EditorPreferenceModel, visible: State<bool>) -> Self {
+        let font_size = preferences.font_size.get();
+        let font_control = HStack::new()
+            .gap(StackGap::Medium)
+            .child(
+                Slider::new(preferences.font_size.binding())
+                    .range(10.0..=32.0)
+                    .step(1.0)
+                    .frame(220.0, Theme::current().layout.control_height),
+            )
+            .child(
+                Text::metadata(format!("{font_size:.0} pt"))
+                    .frame(48.0, Theme::current().layout.control_height),
+            );
+        let page = SettingsPage::form("Editor")
+            .subtitle("Choose how documents are displayed while editing.")
+            .section(
+                SettingsSection::new("Text Editing")
+                    .row(
+                        SettingsRow::new(
+                            "Line Wrapping",
+                            Switch::new(preferences.line_wrap.binding()),
+                        )
+                        .description("Wrap long lines to the width of the window"),
+                    )
+                    .row(
+                        SettingsRow::new("Text Size", font_control)
+                            .description("Size of document text"),
+                    ),
+            )
+            .section(
+                SettingsSection::new("Status Bar").row(
+                    SettingsRow::new(
+                        "Show Line Count",
+                        Switch::new(preferences.show_line_count.binding()),
+                    )
+                    .description("Show the number of lines in the document footer"),
+                ),
+            );
+        let done = Button::new("Done")
+            .size(ButtonSize::Small)
+            .style(ButtonStyle::Ghost)
+            .on_click(move || visible.set(false));
+        Self {
+            page,
+            done,
+            preferences,
+        }
+    }
+
+    fn geometry(bounds: Rect, theme: &Theme) -> (Rect, Rect, Rect) {
+        let bar_height = theme.layout.top_bar_height.min(bounds.size.height);
+        let bar = Rect::new(
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bar_height,
+        );
+        let done = Rect::new(
+            bounds.origin.x + bounds.size.width - theme.spacing.large - 72.0,
+            bounds.origin.y + (bar_height - theme.layout.compact_control_height) / 2.0,
+            72.0,
+            theme.layout.compact_control_height,
+        );
+        let content = Rect::new(
+            bounds.origin.x + theme.spacing.extra_large,
+            bounds.origin.y + bar_height + theme.spacing.extra_large,
+            (bounds.size.width - theme.spacing.extra_large * 2.0).max(0.0),
+            (bounds.size.height - bar_height - theme.spacing.extra_large * 2.0).max(0.0),
+        );
+        (bar, done, content)
+    }
+}
+
+impl View for EditSettingsView {
+    fn measure(&self, constraints: Constraints, _context: &mut MeasureContext<'_>) -> Size {
+        constraints.constrain(constraints.maximum)
+    }
+
+    fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
+        let (bar, done, content) = Self::geometry(bounds, context.theme);
+        Rectangle::new()
+            .color(RectangleColor::Custom(context.theme.colors.surface))
+            .paint(bounds, context);
+        let title = vertically_centered_text(bar, TextRole::Label, context);
+        Text::label("Settings")
+            .weight(600)
+            .alignment(TextAlignment::Center)
+            .paint(title, context);
+        self.done.paint(done, context);
+        paint_top_or_bottom_divider(bar, false, context);
+        self.page.paint(content, context);
+
+        if let Some(error) = self.preferences.save_error.borrow().as_ref() {
+            let status = Rect::new(
+                content.origin.x,
+                bounds.origin.y + bounds.size.height - context.theme.layout.status_bar_height,
+                content.size.width,
+                context.theme.layout.status_bar_height,
+            );
+            Text::metadata(error.clone()).paint(status, context);
+        }
+    }
+
+    fn handle_event(
+        &self,
+        bounds: Rect,
+        event: &ViewEvent,
+        context: &mut EventContext<'_>,
+    ) -> EventResult {
+        let (_, done, content) = Self::geometry(bounds, context.theme());
+        self.done
+            .handle_event(done, event, context)
+            .merge(self.page.handle_event(content, event, context))
     }
 }
 
@@ -370,13 +753,9 @@ fn paint_top_or_bottom_divider(bounds: Rect, top: bool, context: &mut PaintConte
     });
 }
 
-fn vertically_centered_text(
-    bounds: Rect,
-    role: TextRole,
-    context: &PaintContext<'_>,
-) -> Rect {
-    let line_height = context.typography.style(role).line_height
-        * context.text_measurer.font_scale();
+fn vertically_centered_text(bounds: Rect, role: TextRole, context: &PaintContext<'_>) -> Rect {
+    let line_height =
+        context.typography.style(role).line_height * context.text_measurer.font_scale();
     Rect::new(
         bounds.origin.x,
         bounds.origin.y + ((bounds.size.height - line_height) / 2.0).max(0.0),
@@ -392,6 +771,7 @@ fn main() -> Result<(), ViewKitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn recognizes_structured_text_types() {
@@ -399,5 +779,28 @@ mod tests {
         assert_eq!(file_type_for_path(Path::new("version.toml")), "TOML");
         assert_eq!(file_type_for_path(Path::new("notes.txt")), "Plain Text");
         assert_eq!(file_type_for_path(Path::new("README")), "Plain Text");
+    }
+
+    #[test]
+    fn atomic_save_preserves_utf8_bom_and_permissions() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("mochios-edit-save-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.txt");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        save_document(&path, "new\ntext", true).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbfnew\ntext");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
