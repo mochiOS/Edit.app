@@ -1,0 +1,12 @@
+name = "Edit"
+bundle_id = "org.mochios.edit"
+version = "0.1.0"
+developer = "mochiOS"
+entry = "entry.elf"
+description = "Plain text editor"
+icon = "appicon.png"
+
+resources = [
+    "appicon.png",
+]
+
