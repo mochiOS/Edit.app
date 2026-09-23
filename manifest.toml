@@ -15,5 +15,9 @@ abi = "mochios-1"
 path = "/applications/Edit.app/entry.elf"
 kind = "application"
 requires = [
+    "ipc.client",
     "window.create",
+    "fs.read.user",
+    "clipboard.read",
+    "clipboard.write",
 ]
