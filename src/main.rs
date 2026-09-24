@@ -31,7 +31,6 @@ impl App for EditApp {
         if let Some(contents) = document.contents.take() {
             editor.set_value(contents);
         }
-        editor.focus();
         let preferences = EditorPreferenceModel::load();
         Self {
             saved_revision: Rc::new(Cell::new(editor.revision())),
