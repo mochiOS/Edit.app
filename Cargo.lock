@@ -851,8 +851,6 @@ dependencies = [
 [[package]]
 name = "libc"
 version = "0.2.189"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libloading"
@@ -959,20 +957,35 @@ dependencies = [
 [[package]]
 name = "mnu-abi"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/mnu#69f73f85ca10c6cc63c5535eb228d06822aab175"
+
+[[package]]
+name = "mochi-user-platform"
+version = "0.1.0"
+dependencies = [
+ "mnu-abi",
+ "mochi-user-syscall",
+ "mochios-capability-protocol",
+ "mochios-workspace-protocol",
+]
 
 [[package]]
 name = "mochi-user-syscall"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/syscalls#0b494cb448832b1b5e3542eaa61c66d1d0c5904d"
 dependencies = [
  "mnu-abi",
 ]
 
 [[package]]
+name = "mochios-capability-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "mochios-viewkit-gpu-protocol"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/syscalls#0b494cb448832b1b5e3542eaa61c66d1d0c5904d"
+
+[[package]]
+name = "mochios-workspace-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "moxcms"
@@ -2269,11 +2282,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "viewkit"
 version = "2.0.0"
-source = "git+https://github.com/mochiOS/viewkit#f35893d2c4d64e55ba7723ef360644d94b731d40"
 dependencies = [
  "bytemuck",
  "cosmic-text",
  "image",
+ "mochi-user-platform",
  "mochi-user-syscall",
  "mochios-viewkit-gpu-protocol",
  "pollster",
@@ -3036,3 +3049,47 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "mboot-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-mdriver-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "rustc-std-workspace-alloc"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "rustc-std-workspace-std"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "mochios-linux-gui-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-linux-portal-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-signature-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-tls-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-user-database"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-user-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-virtio-gpu-protocol"
+version = "0.1.0"

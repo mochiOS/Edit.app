@@ -772,6 +772,8 @@ fn main() -> Result<(), ViewKitError> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use viewkit::platform::KeyModifiers;
+    use viewkit::typography::TextMeasurer;
 
     #[test]
     fn recognizes_structured_text_types() {
@@ -801,6 +803,63 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_shortcut_writes_the_current_editor_contents() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("mochios-edit-shortcut-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.txt");
+        fs::write(&path, b"old").unwrap();
+
+        let editor = TextEditorInteractionState::new();
+        editor.set_value("saved from shortcut");
+        editor.focus();
+        let preferences = EditorPreferences::default();
+        let preference_model = EditorPreferenceModel {
+            line_wrap: State::new(preferences.line_wrap),
+            show_line_count: State::new(preferences.show_line_count),
+            font_size: State::new(preferences.font_size),
+            persisted: Rc::new(RefCell::new(preferences)),
+            save_error: Rc::new(RefCell::new(None)),
+        };
+        let view = EditView::new(
+            editor,
+            DocumentIdentity {
+                display_name: String::from("document.txt"),
+                file_type: "Plain Text",
+                encoding: "UTF-8",
+                contents: None,
+                path: Some(path.clone()),
+                writes_bom: false,
+                can_save: true,
+            },
+            preference_model,
+            State::new(false),
+            Rc::new(Cell::new(0)),
+            Rc::new(RefCell::new(None)),
+        );
+        let theme = Theme::LIGHT;
+        let mut text_measurer = TextMeasurer::new();
+        let mut context = EventContext::new(&theme, &theme.typography, &mut text_measurer);
+
+        let result = view.handle_event(
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+            &ViewEvent::KeyPressed {
+                key: Key::Character('s'),
+                modifiers: KeyModifiers::from_bits(KeyModifiers::CONTROL),
+            },
+            &mut context,
+        );
+
+        assert_eq!(result, EventResult::Consumed);
+        assert_eq!(fs::read_to_string(path).unwrap(), "saved from shortcut");
         fs::remove_dir_all(root).unwrap();
     }
 }
