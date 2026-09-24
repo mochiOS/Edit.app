@@ -16,6 +16,7 @@ path = "/applications/Edit.app/entry.elf"
 kind = "application"
 requires = [
     "ipc.client",
+    "ipc.server",
     "window.create",
     "fs.read.user",
     "fs.write.user",
