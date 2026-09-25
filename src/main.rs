@@ -6,16 +6,18 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use preferences::EditorPreferences;
 use viewkit::draw_command::DrawCommand;
 use viewkit::event::{EventContext, EventResult, ViewEvent};
+use viewkit::platform::PointerButton;
 use viewkit::prelude::*;
 use viewkit::view::{Constraints, MeasureContext, PaintContext};
 
 struct EditApp {
     editor: TextEditorInteractionState,
-    document: DocumentIdentity,
+    document: Rc<RefCell<DocumentIdentity>>,
     preferences: EditorPreferenceModel,
     settings_visible: State<bool>,
     saved_revision: Rc<Cell<u64>>,
@@ -35,7 +37,7 @@ impl App for EditApp {
         Self {
             saved_revision: Rc::new(Cell::new(editor.revision())),
             editor,
-            document,
+            document: Rc::new(RefCell::new(document)),
             preferences,
             settings_visible: State::new(false),
             save_status: Rc::new(RefCell::new(None)),
@@ -43,7 +45,7 @@ impl App for EditApp {
     }
 
     fn window(&self) -> WindowOptions {
-        WindowOptions::new(format!("{} — Edit", self.document.display_name))
+        WindowOptions::new(format!("{} — Edit", self.document.borrow().display_name))
             .size(860.0, 640.0)
             .resizable(true)
     }
@@ -51,7 +53,7 @@ impl App for EditApp {
     fn body(&self, _context: &ViewContext) -> Self::Body {
         EditView::new(
             self.editor.clone(),
-            self.document.clone(),
+            Rc::clone(&self.document),
             self.preferences.clone(),
             self.settings_visible.clone(),
             self.saved_revision.clone(),
@@ -242,6 +244,421 @@ fn save_document(path: &Path, contents: &str, writes_bom: bool) -> io::Result<()
     result
 }
 
+#[derive(Clone)]
+struct SaveAsEntry {
+    path: PathBuf,
+    name: String,
+    directory: bool,
+}
+
+fn save_as_entries(directory: &Path, root: &Path) -> Vec<SaveAsEntry> {
+    let mut entries = fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = entry.metadata().ok()?;
+            if metadata.is_dir()
+                && fs::canonicalize(&path)
+                    .ok()
+                    .is_none_or(|canonical| !canonical.starts_with(root))
+            {
+                return None;
+            }
+            Some(SaveAsEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                path,
+                directory: metadata.is_dir(),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .directory
+            .cmp(&left.directory)
+            .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()))
+    });
+    entries
+}
+
+fn valid_save_name(name: &str) -> bool {
+    let path = Path::new(name);
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.bytes().any(|byte| byte == b'/' || byte == 0)
+        && path.components().count() == 1
+}
+
+fn attempt_save_as(
+    document: &Rc<RefCell<DocumentIdentity>>,
+    editor: &TextEditorInteractionState,
+    directory: &Rc<RefCell<PathBuf>>,
+    name: &TextFieldInteractionState,
+    pending_replace: &Rc<RefCell<Option<PathBuf>>>,
+    error: &Rc<RefCell<Option<String>>>,
+    saved_revision: &Rc<Cell<u64>>,
+    save_status: &Rc<RefCell<Option<String>>>,
+    visible: &State<bool>,
+) {
+    let filename = name.value();
+    if !valid_save_name(filename.trim()) {
+        *error.borrow_mut() = Some(String::from("Enter a valid file name."));
+        return;
+    }
+    let Ok(directory) = fs::canonicalize(directory.borrow().as_path()) else {
+        *error.borrow_mut() = Some(String::from("The selected folder is no longer available."));
+        return;
+    };
+    let destination = directory.join(filename.trim());
+    if destination.is_dir() {
+        *error.borrow_mut() = Some(String::from("A folder already uses this name."));
+        return;
+    }
+    if destination.exists() && pending_replace.borrow().as_ref() != Some(&destination) {
+        *pending_replace.borrow_mut() = Some(destination);
+        *error.borrow_mut() = Some(String::from(
+            "A file already uses this name. Select Save again to replace it.",
+        ));
+        return;
+    }
+    let writes_bom = document.borrow().writes_bom;
+    match save_document(&destination, &editor.value(), writes_bom) {
+        Ok(()) => {
+            let mut identity = document.borrow_mut();
+            identity.display_name = filename.trim().to_owned();
+            identity.file_type = file_type_for_path(&destination);
+            identity.encoding = if writes_bom { "UTF-8 with BOM" } else { "UTF-8" };
+            identity.path = Some(destination);
+            identity.can_save = true;
+            saved_revision.set(editor.revision());
+            *save_status.borrow_mut() = Some(String::from("Saved"));
+            error.borrow_mut().take();
+            pending_replace.borrow_mut().take();
+            visible.set(false);
+        }
+        Err(save_error) => {
+            *error.borrow_mut() = Some(format!("Unable to save: {save_error}"));
+        }
+    }
+}
+
+struct SaveAsPanel {
+    visible: State<bool>,
+    root: PathBuf,
+    directory: Rc<RefCell<PathBuf>>,
+    entries: Rc<RefCell<Vec<SaveAsEntry>>>,
+    selected: Rc<Cell<Option<usize>>>,
+    scroll: Rc<Cell<f32>>,
+    last_click: Rc<RefCell<Option<(usize, Instant)>>>,
+    name_state: TextFieldInteractionState,
+    name_field: TextField,
+    error: Rc<RefCell<Option<String>>>,
+    pending_replace: Rc<RefCell<Option<PathBuf>>>,
+    up: Button,
+    cancel: Button,
+    save: Button,
+}
+
+#[derive(Clone, Copy)]
+struct SaveAsGeometry {
+    dialog: Rect,
+    up: Rect,
+    location: Rect,
+    list: Rect,
+    name: Rect,
+    error: Rect,
+    cancel: Rect,
+    save: Rect,
+}
+
+impl SaveAsPanel {
+    fn new(
+        document: Rc<RefCell<DocumentIdentity>>,
+        editor: TextEditorInteractionState,
+        saved_revision: Rc<Cell<u64>>,
+        save_status: Rc<RefCell<Option<String>>>,
+    ) -> Self {
+        let root = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|path| fs::canonicalize(path).ok())
+            .unwrap_or_else(|| PathBuf::from("/home/testuser"));
+        let initial = document
+            .borrow()
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(|path| fs::canonicalize(path).ok())
+            .filter(|path| path.starts_with(&root))
+            .unwrap_or_else(|| root.clone());
+        let directory = Rc::new(RefCell::new(initial.clone()));
+        let entries = Rc::new(RefCell::new(save_as_entries(&initial, &root)));
+        let visible = State::new(false);
+        let name_state = TextFieldInteractionState::new();
+        let initial_name = document.borrow().display_name.clone();
+        name_state.set_value(if initial_name == "Untitled" {
+            String::from("Untitled.txt")
+        } else {
+            initial_name
+        });
+        let name_field = TextField::with_interaction(name_state.clone()).placeholder("File name");
+        let selected = Rc::new(Cell::new(None));
+        let scroll = Rc::new(Cell::new(0.0));
+        let error = Rc::new(RefCell::new(None));
+        let pending_replace = Rc::new(RefCell::new(None));
+
+        let up_directory = Rc::clone(&directory);
+        let up_entries = Rc::clone(&entries);
+        let up_selected = Rc::clone(&selected);
+        let up_scroll = Rc::clone(&scroll);
+        let up_root = root.clone();
+        let up = Button::new("Up")
+            .size(ButtonSize::Small)
+            .style(ButtonStyle::Ghost)
+            .on_click(move || {
+                let parent = up_directory
+                    .borrow()
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .filter(|path| path.starts_with(&up_root));
+                if let Some(parent) = parent {
+                    *up_directory.borrow_mut() = parent.clone();
+                    *up_entries.borrow_mut() = save_as_entries(&parent, &up_root);
+                    up_selected.set(None);
+                    up_scroll.set(0.0);
+                }
+            });
+
+        let cancel_visible = visible.clone();
+        let cancel_error = Rc::clone(&error);
+        let cancel_pending = Rc::clone(&pending_replace);
+        let cancel = Button::new("Cancel")
+            .size(ButtonSize::Small)
+            .style(ButtonStyle::Standard)
+            .on_click(move || {
+                cancel_visible.set(false);
+                cancel_error.borrow_mut().take();
+                cancel_pending.borrow_mut().take();
+            });
+
+        let save_document_identity = Rc::clone(&document);
+        let save_editor = editor.clone();
+        let save_directory = Rc::clone(&directory);
+        let save_name = name_state.clone();
+        let save_pending = Rc::clone(&pending_replace);
+        let save_error = Rc::clone(&error);
+        let save_revision = Rc::clone(&saved_revision);
+        let save_status_state = Rc::clone(&save_status);
+        let save_visible = visible.clone();
+        let save = Button::new("Save")
+            .size(ButtonSize::Small)
+            .style(ButtonStyle::Accent)
+            .on_click(move || {
+                attempt_save_as(
+                    &save_document_identity,
+                    &save_editor,
+                    &save_directory,
+                    &save_name,
+                    &save_pending,
+                    &save_error,
+                    &save_revision,
+                    &save_status_state,
+                    &save_visible,
+                );
+            });
+
+        Self {
+            visible,
+            root,
+            directory,
+            entries,
+            selected,
+            scroll,
+            last_click: Rc::new(RefCell::new(None)),
+            name_state,
+            name_field,
+            error,
+            pending_replace,
+            up,
+            cancel,
+            save,
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.visible.get()
+    }
+
+    fn show(&self) {
+        self.error.borrow_mut().take();
+        self.pending_replace.borrow_mut().take();
+        self.name_state.set_focused(true);
+        self.visible.set(true);
+    }
+
+    fn geometry(bounds: Rect) -> SaveAsGeometry {
+        let width = (bounds.size.width - 64.0).clamp(420.0, 680.0);
+        let height = (bounds.size.height - 64.0).clamp(360.0, 520.0);
+        let dialog = Rect::new(
+            bounds.origin.x + (bounds.size.width - width) / 2.0,
+            bounds.origin.y + (bounds.size.height - height) / 2.0,
+            width,
+            height,
+        );
+        let inset = 20.0;
+        let top = dialog.origin.y + 54.0;
+        let up = Rect::new(dialog.origin.x + inset, top, 56.0, 30.0);
+        let location = Rect::new(dialog.origin.x + 88.0, top, width - 108.0, 30.0);
+        let list = Rect::new(
+            dialog.origin.x + inset,
+            top + 42.0,
+            width - inset * 2.0,
+            height - 190.0,
+        );
+        let name = Rect::new(dialog.origin.x + inset, dialog.origin.y + height - 86.0, width - 236.0, 32.0);
+        let error = Rect::new(dialog.origin.x + inset, dialog.origin.y + height - 48.0, width - 220.0, 22.0);
+        let cancel = Rect::new(dialog.origin.x + width - 188.0, dialog.origin.y + height - 86.0, 76.0, 32.0);
+        let save = Rect::new(dialog.origin.x + width - 100.0, dialog.origin.y + height - 86.0, 80.0, 32.0);
+        SaveAsGeometry { dialog, up, location, list, name, error, cancel, save }
+    }
+
+    fn navigate(&self, path: PathBuf) {
+        let Ok(path) = fs::canonicalize(path) else { return; };
+        if !path.starts_with(&self.root) || !path.is_dir() {
+            return;
+        }
+        *self.directory.borrow_mut() = path.clone();
+        *self.entries.borrow_mut() = save_as_entries(&path, &self.root);
+        self.selected.set(None);
+        self.scroll.set(0.0);
+        self.last_click.borrow_mut().take();
+    }
+}
+
+impl View for SaveAsPanel {
+    fn measure(&self, constraints: Constraints, _context: &mut MeasureContext<'_>) -> Size {
+        constraints.constrain(constraints.maximum)
+    }
+
+    fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
+        let geometry = Self::geometry(bounds);
+        Rectangle::new()
+            .color(RectangleColor::Custom(context.theme.shell.scrim))
+            .paint(bounds, context);
+        Rectangle::new()
+            .color(RectangleColor::Custom(context.theme.dialog.background))
+            .radius(context.theme.dialog.radius)
+            .border(BorderStyle::custom(
+                context.theme.dialog.border,
+                context.theme.dialog.stroke_width,
+            ))
+            .paint(geometry.dialog, context);
+        Text::styled("Save As", TextRole::TitleSmall).paint(
+            Rect::new(geometry.dialog.origin.x + 20.0, geometry.dialog.origin.y + 18.0, geometry.dialog.size.width - 40.0, 26.0),
+            context,
+        );
+        self.up.paint(geometry.up, context);
+        Text::body(self.directory.borrow().display().to_string()).paint(geometry.location, context);
+        Rectangle::new()
+            .color(RectangleColor::Custom(context.theme.colors.surface_subtle))
+            .radius(CornerRadius::Small)
+            .border(BorderStyle::custom(context.theme.colors.border, 1.0))
+            .paint(geometry.list, context);
+        context.display_list.push(DrawCommand::PushClip { rect: geometry.list });
+        let row_height = 34.0;
+        for (index, entry) in self.entries.borrow().iter().enumerate() {
+            let row = Rect::new(
+                geometry.list.origin.x,
+                geometry.list.origin.y + index as f32 * row_height - self.scroll.get(),
+                geometry.list.size.width,
+                row_height,
+            );
+            if row.origin.y + row.size.height <= geometry.list.origin.y
+                || row.origin.y >= geometry.list.origin.y + geometry.list.size.height
+            {
+                continue;
+            }
+            if self.selected.get() == Some(index) {
+                Rectangle::new()
+                    .color(RectangleColor::Custom(context.theme.colors.accent_soft))
+                    .paint(row, context);
+            }
+            let label = if entry.directory {
+                format!("{} /", entry.name)
+            } else {
+                entry.name.clone()
+            };
+            Text::body(label).paint(
+                Rect::new(row.origin.x + 12.0, row.origin.y + 7.0, row.size.width - 24.0, 20.0),
+                context,
+            );
+        }
+        context.display_list.push(DrawCommand::PopClip);
+        self.name_field.paint(geometry.name, context);
+        if let Some(error) = self.error.borrow().as_ref() {
+            Text::metadata(error.clone()).paint(geometry.error, context);
+        }
+        self.cancel.paint(geometry.cancel, context);
+        self.save.paint(geometry.save, context);
+    }
+
+    fn handle_event(
+        &self,
+        bounds: Rect,
+        event: &ViewEvent,
+        context: &mut EventContext<'_>,
+    ) -> EventResult {
+        let geometry = Self::geometry(bounds);
+        if matches!(event, ViewEvent::KeyPressed { key: Key::Escape, .. }) {
+            self.visible.set(false);
+            self.name_state.set_focused(false);
+            context.request_redraw();
+            return EventResult::Consumed;
+        }
+        let previous_name = self.name_state.value();
+        let mut result = self.name_field.handle_event(geometry.name, event, context);
+        if self.name_state.value() != previous_name {
+            self.pending_replace.borrow_mut().take();
+            self.error.borrow_mut().take();
+        }
+        result = result
+            .merge(self.up.handle_event(geometry.up, event, context))
+            .merge(self.cancel.handle_event(geometry.cancel, event, context))
+            .merge(self.save.handle_event(geometry.save, event, context));
+        if let ViewEvent::Scroll { position, delta_y, .. } = event
+            && geometry.list.contains(*position)
+        {
+            let maximum = (self.entries.borrow().len() as f32 * 34.0 - geometry.list.size.height).max(0.0);
+            self.scroll.set((self.scroll.get() - *delta_y * 34.0).clamp(0.0, maximum));
+            context.request_redraw_in(geometry.list);
+            return EventResult::Consumed;
+        }
+        if let ViewEvent::PointerReleased { position, button: PointerButton::Primary } = event
+            && geometry.list.contains(*position)
+        {
+            let index = ((position.y - geometry.list.origin.y + self.scroll.get()) / 34.0) as usize;
+            if let Some(entry) = self.entries.borrow().get(index).cloned() {
+                let now = Instant::now();
+                let double_click = self.last_click.borrow().as_ref().is_some_and(|(previous, instant)| {
+                    *previous == index && now.saturating_duration_since(*instant) <= Duration::from_millis(500)
+                });
+                *self.last_click.borrow_mut() = Some((index, now));
+                self.selected.set(Some(index));
+                if entry.directory && double_click {
+                    self.navigate(entry.path);
+                } else if !entry.directory {
+                    self.name_state.set_value(entry.name);
+                    self.pending_replace.borrow_mut().take();
+                }
+                context.request_redraw();
+            }
+            return EventResult::Consumed;
+        }
+        if result.is_consumed() { result } else { EventResult::Consumed }
+    }
+}
+
 #[derive(Default)]
 struct FindState {
     visible: bool,
@@ -255,12 +672,13 @@ struct EditView {
     find_field_state: TextFieldInteractionState,
     find_field: TextField,
     find_state: RefCell<FindState>,
-    document: DocumentIdentity,
+    document: Rc<RefCell<DocumentIdentity>>,
     preferences: EditorPreferenceModel,
     settings_visible: State<bool>,
     settings: EditSettingsView,
     saved_revision: Rc<Cell<u64>>,
     save_status: Rc<RefCell<Option<String>>>,
+    save_as: SaveAsPanel,
 }
 
 #[derive(Clone, Copy)]
@@ -275,7 +693,7 @@ struct EditGeometry {
 impl EditView {
     fn new(
         editor_state: TextEditorInteractionState,
-        document: DocumentIdentity,
+        document: Rc<RefCell<DocumentIdentity>>,
         preferences: EditorPreferenceModel,
         settings_visible: State<bool>,
         saved_revision: Rc<Cell<u64>>,
@@ -283,6 +701,12 @@ impl EditView {
     ) -> Self {
         let find_field_state = TextFieldInteractionState::new();
         let settings = EditSettingsView::new(preferences.clone(), settings_visible.clone());
+        let save_as = SaveAsPanel::new(
+            Rc::clone(&document),
+            editor_state.clone(),
+            Rc::clone(&saved_revision),
+            Rc::clone(&save_status),
+        );
         Self {
             editor: TextEditor::with_interaction(editor_state.clone())
                 .placeholder("Start typing")
@@ -301,25 +725,30 @@ impl EditView {
             settings,
             saved_revision,
             save_status,
+            save_as,
         }
     }
 
-    fn save(&self) {
-        let Some(path) = self.document.path.as_deref() else {
-            *self.save_status.borrow_mut() = Some(String::from("Save As is required"));
-            return;
+    fn save(&self) -> bool {
+        let document = self.document.borrow();
+        let Some(path) = document.path.as_deref() else {
+            drop(document);
+            self.save_as.show();
+            return false;
         };
-        if !self.document.can_save {
+        if !document.can_save {
             *self.save_status.borrow_mut() = Some(String::from("This document cannot be saved"));
-            return;
+            return false;
         }
-        match save_document(path, &self.editor_state.value(), self.document.writes_bom) {
+        match save_document(path, &self.editor_state.value(), document.writes_bom) {
             Ok(()) => {
                 self.saved_revision.set(self.editor_state.revision());
                 *self.save_status.borrow_mut() = Some(String::from("Saved"));
+                true
             }
             Err(error) => {
                 *self.save_status.borrow_mut() = Some(format!("Unable to save: {error}"));
+                false
             }
         }
     }
@@ -449,7 +878,8 @@ impl View for EditView {
             TextRole::Caption,
             context,
         );
-        let mut file_status = self.document.file_type.to_owned();
+        let document = self.document.borrow();
+        let mut file_status = document.file_type.to_owned();
         if let Some(status) = self.save_status.borrow().as_ref() {
             file_status.push_str("    ");
             file_status.push_str(status);
@@ -467,17 +897,21 @@ impl View for EditView {
             let line_label = if lines == 1 { "line" } else { "lines" };
             format!(
                 "{}    {} {}    {} {}",
-                self.document.encoding, lines, line_label, characters, character_label
+                document.encoding, lines, line_label, characters, character_label
             )
         } else {
             format!(
                 "{}    {} {}",
-                self.document.encoding, characters, character_label
+                document.encoding, characters, character_label
             )
         };
         Text::metadata(statistics)
             .alignment(TextAlignment::End)
             .paint(footer_text, context);
+        drop(document);
+        if self.save_as.is_visible() {
+            self.save_as.paint(bounds, context);
+        }
     }
 
     fn handle_event(
@@ -486,6 +920,10 @@ impl View for EditView {
         event: &ViewEvent,
         context: &mut EventContext<'_>,
     ) -> EventResult {
+        if self.save_as.is_visible() {
+            return self.save_as.handle_event(bounds, event, context);
+        }
+
         if matches!(
             event,
             ViewEvent::KeyPressed {
@@ -538,9 +976,20 @@ impl View for EditView {
             ViewEvent::KeyPressed {
                 key: Key::Character('s' | 'S'),
                 modifiers
+            } if modifiers.shortcut() && modifiers.shift()
+        ) {
+            self.save_as.show();
+            context.request_redraw();
+            return EventResult::Consumed;
+        }
+        if matches!(
+            event,
+            ViewEvent::KeyPressed {
+                key: Key::Character('s' | 'S'),
+                modifiers
             } if modifiers.shortcut()
         ) {
-            self.save();
+            let _ = self.save();
             context.request_redraw_in(geometry.footer);
             return EventResult::Consumed;
         }
@@ -806,6 +1255,79 @@ mod tests {
     }
 
     #[test]
+    fn save_as_requires_confirmation_before_replacing_a_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "mochios-edit-save-as-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("notes.txt");
+        fs::write(&destination, "old").unwrap();
+
+        let document = Rc::new(RefCell::new(DocumentIdentity {
+            display_name: String::from("Untitled"),
+            file_type: "Plain Text",
+            encoding: "UTF-8",
+            contents: None,
+            path: None,
+            writes_bom: false,
+            can_save: false,
+        }));
+        let editor = TextEditorInteractionState::new();
+        editor.set_value("replacement");
+        let directory = Rc::new(RefCell::new(root.clone()));
+        let name = TextFieldInteractionState::new();
+        name.set_value("notes.txt");
+        let pending = Rc::new(RefCell::new(None));
+        let error = Rc::new(RefCell::new(None));
+        let saved_revision = Rc::new(Cell::new(0));
+        let status = Rc::new(RefCell::new(None));
+        let visible = State::new(true);
+
+        attempt_save_as(
+            &document,
+            &editor,
+            &directory,
+            &name,
+            &pending,
+            &error,
+            &saved_revision,
+            &status,
+            &visible,
+        );
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "old");
+        assert_eq!(pending.borrow().as_ref(), Some(&destination));
+
+        attempt_save_as(
+            &document,
+            &editor,
+            &directory,
+            &name,
+            &pending,
+            &error,
+            &saved_revision,
+            &status,
+            &visible,
+        );
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "replacement");
+        assert_eq!(document.borrow().path.as_ref(), Some(&destination));
+        assert!(!visible.get());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_as_rejects_path_components_as_file_names() {
+        assert!(valid_save_name("notes.txt"));
+        assert!(!valid_save_name("../notes.txt"));
+        assert!(!valid_save_name("folder/notes.txt"));
+        assert!(!valid_save_name(".."));
+    }
+
+    #[test]
     fn save_shortcut_writes_the_current_editor_contents() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -830,7 +1352,7 @@ mod tests {
         };
         let view = EditView::new(
             editor,
-            DocumentIdentity {
+            Rc::new(RefCell::new(DocumentIdentity {
                 display_name: String::from("document.txt"),
                 file_type: "Plain Text",
                 encoding: "UTF-8",
@@ -838,7 +1360,7 @@ mod tests {
                 path: Some(path.clone()),
                 writes_bom: false,
                 can_save: true,
-            },
+            })),
             preference_model,
             State::new(false),
             Rc::new(Cell::new(0)),
