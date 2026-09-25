@@ -23,7 +23,7 @@ struct EditApp {
 }
 
 impl App for EditApp {
-    type Body = EditView;
+    type Body = ApplicationMenuBar<EditView>;
 
     fn new() -> Self {
         let mut document = DocumentIdentity::from_arguments();
@@ -49,14 +49,91 @@ impl App for EditApp {
     }
 
     fn body(&self, _context: &ViewContext) -> Self::Body {
-        EditView::new(
+        let view = EditView::new(
             self.editor.clone(),
             Rc::clone(&self.document),
             self.preferences.clone(),
             self.settings_visible.clone(),
             self.saved_revision.clone(),
             self.save_status.clone(),
-        )
+        );
+
+        let open_panel = view.open_panel.clone();
+        let save_panel = view.save_panel.clone();
+        let save_document = Rc::clone(&self.document);
+        let save_editor = self.editor.clone();
+        let save_revision = Rc::clone(&self.saved_revision);
+        let save_status = Rc::clone(&self.save_status);
+        let save_fallback_panel = save_panel.clone();
+
+        let find_state = Rc::clone(&view.find_state);
+        let find_field = view.find_field_state.clone();
+        let show_find_state = Rc::clone(&view.find_state);
+        let show_find_field = view.find_field_state.clone();
+        let find_checked = Rc::clone(&view.find_state);
+
+        let settings_visible = self.settings_visible.clone();
+        let view_settings_visible = self.settings_visible.clone();
+
+        ApplicationMenuBar::new(view)
+            .menu(
+                ApplicationMenu::new("File")
+                    .item(
+                        ApplicationMenuItem::new("Open…", move || open_panel.show())
+                            .shortcut(MenuShortcut::command('o', "Ctrl+O")),
+                    )
+                    .separator()
+                    .item(
+                        ApplicationMenuItem::new("Save", move || {
+                            let _ = save_current_document(
+                                &save_document,
+                                &save_editor,
+                                &save_revision,
+                                &save_status,
+                                &save_fallback_panel,
+                            );
+                        })
+                        .shortcut(MenuShortcut::command('s', "Ctrl+S")),
+                    )
+                    .item(
+                        ApplicationMenuItem::new("Save As…", move || save_panel.show())
+                            .shortcut(MenuShortcut::command('s', "Ctrl+Shift+S").shift()),
+                    )
+                    .separator()
+                    .item(
+                        ApplicationMenuItem::new("Close", request_exit)
+                            .shortcut(MenuShortcut::command('w', "Ctrl+W")),
+                    ),
+            )
+            .menu(
+                ApplicationMenu::new("Edit")
+                    .item(
+                        ApplicationMenuItem::new("Find…", move || {
+                            find_state.borrow_mut().visible = true;
+                            find_field.set_focused(true);
+                        })
+                        .shortcut(MenuShortcut::command('f', "Ctrl+F")),
+                    )
+                    .separator()
+                    .item(
+                        ApplicationMenuItem::new("Settings…", move || settings_visible.set(true))
+                            .shortcut(MenuShortcut::command(',', "Ctrl+,")),
+                    ),
+            )
+            .menu(
+                ApplicationMenu::new("View")
+                    .item(
+                        ApplicationMenuItem::new("Show Find Bar", move || {
+                            let visible = !show_find_state.borrow().visible;
+                            show_find_state.borrow_mut().visible = visible;
+                            show_find_field.set_focused(visible);
+                        })
+                        .checked_when(move || find_checked.borrow().visible),
+                    )
+                    .item(ApplicationMenuItem::new("Editor Settings…", move || {
+                        view_settings_visible.set(true)
+                    })),
+            )
     }
 }
 
@@ -347,6 +424,36 @@ fn make_open_panel(
     )
 }
 
+fn save_current_document(
+    document: &Rc<RefCell<DocumentIdentity>>,
+    editor: &TextEditorInteractionState,
+    saved_revision: &Rc<Cell<u64>>,
+    save_status: &Rc<RefCell<Option<String>>>,
+    save_panel: &SavePanel,
+) -> bool {
+    let document = document.borrow();
+    let Some(path) = document.path.as_deref() else {
+        drop(document);
+        save_panel.show();
+        return false;
+    };
+    if !document.can_save {
+        *save_status.borrow_mut() = Some(String::from("This document cannot be saved"));
+        return false;
+    }
+    match save_document(path, &editor.value(), document.writes_bom) {
+        Ok(()) => {
+            saved_revision.set(editor.revision());
+            *save_status.borrow_mut() = Some(String::from("Saved"));
+            true
+        }
+        Err(error) => {
+            *save_status.borrow_mut() = Some(format!("Unable to save: {error}"));
+            false
+        }
+    }
+}
+
 #[derive(Default)]
 struct FindState {
     visible: bool,
@@ -359,7 +466,7 @@ struct EditView {
     editor: TextEditor,
     find_field_state: TextFieldInteractionState,
     find_field: TextField,
-    find_state: RefCell<FindState>,
+    find_state: Rc<RefCell<FindState>>,
     document: Rc<RefCell<DocumentIdentity>>,
     preferences: EditorPreferenceModel,
     settings_visible: State<bool>,
@@ -413,7 +520,7 @@ impl EditView {
                 .placeholder("Find")
                 .size(TextFieldSize::Small),
             find_field_state,
-            find_state: RefCell::new(FindState::default()),
+            find_state: Rc::new(RefCell::new(FindState::default())),
             document,
             preferences,
             settings_visible,
@@ -426,27 +533,13 @@ impl EditView {
     }
 
     fn save(&self) -> bool {
-        let document = self.document.borrow();
-        let Some(path) = document.path.as_deref() else {
-            drop(document);
-            self.save_panel.show();
-            return false;
-        };
-        if !document.can_save {
-            *self.save_status.borrow_mut() = Some(String::from("This document cannot be saved"));
-            return false;
-        }
-        match save_document(path, &self.editor_state.value(), document.writes_bom) {
-            Ok(()) => {
-                self.saved_revision.set(self.editor_state.revision());
-                *self.save_status.borrow_mut() = Some(String::from("Saved"));
-                true
-            }
-            Err(error) => {
-                *self.save_status.borrow_mut() = Some(format!("Unable to save: {error}"));
-                false
-            }
-        }
+        save_current_document(
+            &self.document,
+            &self.editor_state,
+            &self.saved_revision,
+            &self.save_status,
+            &self.save_panel,
+        )
     }
 
     fn geometry(&self, bounds: Rect, theme: &Theme) -> EditGeometry {
