@@ -7,7 +7,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-viewkit = { git = "https://github.com/mochiOS/viewkit", package = "viewkit" }
+appkit = { package = "mochios-appkit", path = "../../tools/devkit/crates/appkit" }
 
 [[bin]]
 name = "edit"
@@ -18,4 +18,3 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
-

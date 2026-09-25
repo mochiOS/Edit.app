@@ -414,7 +414,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 name = "edit"
 version = "0.1.0"
 dependencies = [
- "viewkit",
+ "mochios-appkit",
 ]
 
 [[package]]
@@ -973,6 +973,14 @@ name = "mochi-user-syscall"
 version = "0.1.0"
 dependencies = [
  "mnu-abi",
+]
+
+[[package]]
+name = "mochios-appkit"
+version = "0.1.0"
+dependencies = [
+ "mochi-user-platform",
+ "viewkit",
 ]
 
 [[package]]
@@ -3051,10 +3059,6 @@ dependencies = [
 ]
 
 [[patch.unused]]
-name = "mboot-protocol"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "mochios-mdriver-protocol"
 version = "0.1.0"
 
@@ -3065,6 +3069,10 @@ version = "1.99.0"
 [[patch.unused]]
 name = "rustc-std-workspace-std"
 version = "1.99.0"
+
+[[patch.unused]]
+name = "mboot-protocol"
+version = "0.1.0"
 
 [[patch.unused]]
 name = "mochios-linux-gui-protocol"
