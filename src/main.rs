@@ -3,7 +3,6 @@ mod preferences;
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -15,11 +14,9 @@ use preferences::EditorPreferences;
 
 struct EditApp {
     editor: TextEditorInteractionState,
-    document: Rc<RefCell<DocumentIdentity>>,
+    document: DocumentController,
     preferences: EditorPreferenceModel,
     settings_visible: State<bool>,
-    saved_revision: Rc<Cell<u64>>,
-    save_status: Rc<RefCell<Option<String>>>,
 }
 
 impl App for EditApp {
@@ -32,18 +29,17 @@ impl App for EditApp {
             editor.set_value(contents);
         }
         let preferences = EditorPreferenceModel::load();
+        let document = make_document_controller(document, editor.clone());
         Self {
-            saved_revision: Rc::new(Cell::new(editor.revision())),
             editor,
-            document: Rc::new(RefCell::new(document)),
+            document,
             preferences,
             settings_visible: State::new(false),
-            save_status: Rc::new(RefCell::new(None)),
         }
     }
 
     fn window(&self) -> WindowOptions {
-        WindowOptions::new(format!("{} — Edit", self.document.borrow().display_name))
+        WindowOptions::new(format!("{} — Edit", self.document.info().display_name))
             .size(860.0, 640.0)
             .resizable(true)
     }
@@ -51,20 +47,15 @@ impl App for EditApp {
     fn body(&self, _context: &ViewContext) -> Self::Body {
         let view = EditView::new(
             self.editor.clone(),
-            Rc::clone(&self.document),
+            self.document.clone(),
             self.preferences.clone(),
             self.settings_visible.clone(),
-            self.saved_revision.clone(),
-            self.save_status.clone(),
         );
 
-        let open_panel = view.open_panel.clone();
-        let save_panel = view.save_panel.clone();
-        let save_document = Rc::clone(&self.document);
-        let save_editor = self.editor.clone();
-        let save_revision = Rc::clone(&self.saved_revision);
-        let save_status = Rc::clone(&self.save_status);
-        let save_fallback_panel = save_panel.clone();
+        let open_document = self.document.clone();
+        let save_document = self.document.clone();
+        let save_as_document = self.document.clone();
+        let quit_document = self.document.clone();
 
         let find_state = Rc::clone(&view.find_state);
         let find_field = view.find_field_state.clone();
@@ -79,30 +70,33 @@ impl App for EditApp {
             .menu(
                 ApplicationMenu::new("File")
                     .item(
-                        ApplicationMenuItem::new("Open…", move || open_panel.show())
+                        ApplicationMenuItem::new("Open…", move || open_document.open())
                             .shortcut(MenuShortcut::command('o', "Ctrl+O")),
                     )
                     .separator()
                     .item(
                         ApplicationMenuItem::new("Save", move || {
-                            let _ = save_current_document(
-                                &save_document,
-                                &save_editor,
-                                &save_revision,
-                                &save_status,
-                                &save_fallback_panel,
-                            );
+                            let _ = save_document.save();
                         })
                         .shortcut(MenuShortcut::command('s', "Ctrl+S")),
                     )
                     .item(
-                        ApplicationMenuItem::new("Save As…", move || save_panel.show())
+                        ApplicationMenuItem::new("Save As…", move || save_as_document.save_as())
                             .shortcut(MenuShortcut::command('s', "Ctrl+Shift+S").shift()),
                     )
                     .separator()
                     .item(
-                        ApplicationMenuItem::new("Close", request_exit)
+                        ApplicationMenuItem::new("Close", request_close_key_window)
                             .shortcut(MenuShortcut::command('w', "Ctrl+W")),
+                    )
+                    .separator()
+                    .item(
+                        ApplicationMenuItem::new("Quit Edit", move || {
+                            if quit_document.request_close_with(request_quit) {
+                                request_quit();
+                            }
+                        })
+                        .shortcut(MenuShortcut::command('q', "Ctrl+Q")),
                     ),
             )
             .menu(
@@ -135,11 +129,15 @@ impl App for EditApp {
                     })),
             )
     }
+
+    fn close_requested(&mut self) -> bool {
+        self.document
+            .request_close_with(|| appkit::viewkit::close_window(WindowId::PRIMARY))
+    }
 }
 
 #[derive(Clone)]
 struct DocumentIdentity {
-    display_name: String,
     file_type: &'static str,
     encoding: &'static str,
     contents: Option<String>,
@@ -162,7 +160,6 @@ impl DocumentIdentity {
             });
         let Some(path) = path else {
             return Self {
-                display_name: "Untitled".into(),
                 file_type: "Plain Text",
                 encoding: "UTF-8",
                 contents: None,
@@ -172,11 +169,6 @@ impl DocumentIdentity {
             };
         };
 
-        let display_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Untitled")
-            .to_owned();
         let file_type = file_type_for_path(&path);
         let (contents, encoding, writes_bom, can_save) = match std::fs::read(&path) {
             Ok(bytes) if bytes.starts_with(&[0xef, 0xbb, 0xbf]) => {
@@ -195,7 +187,6 @@ impl DocumentIdentity {
             Err(_) => (None, "Unavailable", false, false),
         };
         Self {
-            display_name,
             file_type,
             encoding,
             contents,
@@ -278,119 +269,46 @@ fn file_type_for_path(path: &Path) -> &'static str {
 }
 
 fn save_document(path: &Path, contents: &str, writes_bom: bool) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "document has no parent directory",
-        )
-    })?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid document name"))?;
-    let temporary = parent.join(format!(".{name}.edit-{}.new", std::process::id()));
-    match fs::remove_file(&temporary) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    // A Save panel grants this process the selected file, not the surrounding
+    // directory. Write that file directly rather than creating a sibling
+    // temporary file outside the granted scope.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    if writes_bom {
+        file.write_all(&[0xef, 0xbb, 0xbf])?;
     }
-
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        if writes_bom {
-            file.write_all(&[0xef, 0xbb, 0xbf])?;
-        }
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        if let Ok(metadata) = fs::metadata(path) {
-            fs::set_permissions(
-                &temporary,
-                fs::Permissions::from_mode(metadata.permissions().mode() & 0o777),
-            )?;
-        }
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
 }
 
-fn make_save_panel(
-    document: Rc<RefCell<DocumentIdentity>>,
+fn make_document_controller(
+    document: DocumentIdentity,
     editor: TextEditorInteractionState,
-    saved_revision: Rc<Cell<u64>>,
-    save_status: Rc<RefCell<Option<String>>>,
-) -> SavePanel {
-    let identity = document.borrow();
-    let suggested_name = if identity.display_name == "Untitled" {
-        String::from("Untitled.txt")
-    } else {
-        identity.display_name.clone()
+) -> DocumentController {
+    let metadata = DocumentMetadata::new(document.file_type, document.encoding)
+        .writable(document.can_save || document.path.is_none());
+    let info = match document.path {
+        Some(path) => DocumentInfo::at(path, metadata),
+        None => DocumentInfo::untitled(metadata),
     };
-    let initial_directory = identity
-        .path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    drop(identity);
+    let writes_bom = Rc::new(Cell::new(document.writes_bom));
 
-    SavePanel::new(
-        SavePanelOptions {
-            suggested_name,
-            initial_directory,
-            ..SavePanelOptions::default()
-        },
-        move |destination| {
-            let writes_bom = document.borrow().writes_bom;
-            save_document(destination, &editor.value(), writes_bom)
-                .map_err(|error| format!("Unable to save: {error}"))?;
+    let revision_editor = editor.clone();
+    let open_editor = editor.clone();
+    let open_writes_bom = Rc::clone(&writes_bom);
+    let save_editor = editor;
+    let save_writes_bom = Rc::clone(&writes_bom);
 
-            let mut identity = document.borrow_mut();
-            identity.display_name = destination
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("Untitled")
-                .to_owned();
-            identity.file_type = file_type_for_path(destination);
-            identity.encoding = if writes_bom {
-                "UTF-8 with BOM"
-            } else {
-                "UTF-8"
-            };
-            identity.path = Some(destination.to_path_buf());
-            identity.can_save = true;
-            saved_revision.set(editor.revision());
-            *save_status.borrow_mut() = Some(String::from("Saved"));
-            Ok(())
-        },
-    )
-}
-
-fn make_open_panel(
-    document: Rc<RefCell<DocumentIdentity>>,
-    editor: TextEditorInteractionState,
-    saved_revision: Rc<Cell<u64>>,
-    save_status: Rc<RefCell<Option<String>>>,
-) -> OpenPanel {
-    let initial_directory = document
-        .borrow()
-        .path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-
-    OpenPanel::new(
-        OpenPanelOptions {
-            initial_directory,
-            ..OpenPanelOptions::default()
-        },
+    DocumentController::new(
+        info,
+        None,
+        move || revision_editor.revision(),
         move |path| {
             let bytes = fs::read(path).map_err(|error| format!("Unable to open: {error}"))?;
-            let (contents, encoding, writes_bom) = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+            let (contents, encoding, has_bom) = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
                 (
                     String::from_utf8(bytes[3..].to_vec())
                         .map_err(|_| String::from("This file is not valid UTF-8 text."))?,
@@ -405,53 +323,19 @@ fn make_open_panel(
                     false,
                 )
             };
-            editor.set_value(contents);
-            let mut identity = document.borrow_mut();
-            identity.display_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("Untitled")
-                .to_owned();
-            identity.file_type = file_type_for_path(path);
-            identity.encoding = encoding;
-            identity.path = Some(path.to_path_buf());
-            identity.writes_bom = writes_bom;
-            identity.can_save = true;
-            saved_revision.set(editor.revision());
-            save_status.borrow_mut().take();
-            Ok(())
+            open_editor.set_value(contents);
+            open_writes_bom.set(has_bom);
+            Ok(DocumentMetadata::new(file_type_for_path(path), encoding))
+        },
+        move |path| {
+            let has_bom = save_writes_bom.get();
+            save_document(path, &save_editor.value(), has_bom).map_err(|error| error.to_string())?;
+            Ok(DocumentMetadata::new(
+                file_type_for_path(path),
+                if has_bom { "UTF-8 with BOM" } else { "UTF-8" },
+            ))
         },
     )
-}
-
-fn save_current_document(
-    document: &Rc<RefCell<DocumentIdentity>>,
-    editor: &TextEditorInteractionState,
-    saved_revision: &Rc<Cell<u64>>,
-    save_status: &Rc<RefCell<Option<String>>>,
-    save_panel: &SavePanel,
-) -> bool {
-    let document = document.borrow();
-    let Some(path) = document.path.as_deref() else {
-        drop(document);
-        save_panel.show();
-        return false;
-    };
-    if !document.can_save {
-        *save_status.borrow_mut() = Some(String::from("This document cannot be saved"));
-        return false;
-    }
-    match save_document(path, &editor.value(), document.writes_bom) {
-        Ok(()) => {
-            saved_revision.set(editor.revision());
-            *save_status.borrow_mut() = Some(String::from("Saved"));
-            true
-        }
-        Err(error) => {
-            *save_status.borrow_mut() = Some(format!("Unable to save: {error}"));
-            false
-        }
-    }
 }
 
 #[derive(Default)]
@@ -467,14 +351,10 @@ struct EditView {
     find_field_state: TextFieldInteractionState,
     find_field: TextField,
     find_state: Rc<RefCell<FindState>>,
-    document: Rc<RefCell<DocumentIdentity>>,
+    document: DocumentController,
     preferences: EditorPreferenceModel,
     settings_visible: State<bool>,
     settings: EditSettingsView,
-    saved_revision: Rc<Cell<u64>>,
-    save_status: Rc<RefCell<Option<String>>>,
-    save_panel: SavePanel,
-    open_panel: OpenPanel,
 }
 
 #[derive(Clone, Copy)]
@@ -489,26 +369,12 @@ struct EditGeometry {
 impl EditView {
     fn new(
         editor_state: TextEditorInteractionState,
-        document: Rc<RefCell<DocumentIdentity>>,
+        document: DocumentController,
         preferences: EditorPreferenceModel,
         settings_visible: State<bool>,
-        saved_revision: Rc<Cell<u64>>,
-        save_status: Rc<RefCell<Option<String>>>,
     ) -> Self {
         let find_field_state = TextFieldInteractionState::new();
         let settings = EditSettingsView::new(preferences.clone(), settings_visible.clone());
-        let save_panel = make_save_panel(
-            Rc::clone(&document),
-            editor_state.clone(),
-            Rc::clone(&saved_revision),
-            Rc::clone(&save_status),
-        );
-        let open_panel = make_open_panel(
-            Rc::clone(&document),
-            editor_state.clone(),
-            Rc::clone(&saved_revision),
-            Rc::clone(&save_status),
-        );
         Self {
             editor: TextEditor::with_interaction(editor_state.clone())
                 .placeholder("Start typing")
@@ -525,21 +391,11 @@ impl EditView {
             preferences,
             settings_visible,
             settings,
-            saved_revision,
-            save_status,
-            save_panel,
-            open_panel,
         }
     }
 
     fn save(&self) -> bool {
-        save_current_document(
-            &self.document,
-            &self.editor_state,
-            &self.saved_revision,
-            &self.save_status,
-            &self.save_panel,
-        )
+        self.document.save()
     }
 
     fn geometry(&self, bounds: Rect, theme: &Theme) -> EditGeometry {
@@ -632,6 +488,9 @@ impl View for EditView {
     fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
         if self.settings_visible.get() {
             self.settings.paint(bounds, context);
+            if self.document.is_presenting() {
+                self.document.paint(bounds, context);
+            }
             return;
         }
         let geometry = self.geometry(bounds, context.theme);
@@ -667,12 +526,12 @@ impl View for EditView {
             TextRole::Caption,
             context,
         );
-        let document = self.document.borrow();
-        let mut file_status = document.file_type.to_owned();
-        if let Some(status) = self.save_status.borrow().as_ref() {
+        let document = self.document.info();
+        let mut file_status = document.metadata.file_type.clone();
+        if let Some(status) = self.document.status() {
             file_status.push_str("    ");
-            file_status.push_str(status);
-        } else if self.editor_state.revision() != self.saved_revision.get() {
+            file_status.push_str(&status);
+        } else if self.document.is_edited() {
             file_status.push_str("    Edited");
         }
         Text::metadata(file_status).paint(footer_text, context);
@@ -686,22 +545,19 @@ impl View for EditView {
             let line_label = if lines == 1 { "line" } else { "lines" };
             format!(
                 "{}    {} {}    {} {}",
-                document.encoding, lines, line_label, characters, character_label
+                document.metadata.encoding, lines, line_label, characters, character_label
             )
         } else {
             format!(
                 "{}    {} {}",
-                document.encoding, characters, character_label
+                document.metadata.encoding, characters, character_label
             )
         };
         Text::metadata(statistics)
             .alignment(TextAlignment::End)
             .paint(footer_text, context);
-        drop(document);
-        if self.save_panel.is_visible() {
-            self.save_panel.paint(bounds, context);
-        } else if self.open_panel.is_visible() {
-            self.open_panel.paint(bounds, context);
+        if self.document.is_presenting() {
+            self.document.paint(bounds, context);
         }
     }
 
@@ -711,11 +567,8 @@ impl View for EditView {
         event: &ViewEvent,
         context: &mut EventContext<'_>,
     ) -> EventResult {
-        if self.save_panel.is_visible() {
-            return self.save_panel.handle_event(bounds, event, context);
-        }
-        if self.open_panel.is_visible() {
-            return self.open_panel.handle_event(bounds, event, context);
+        if self.document.is_presenting() {
+            return self.document.handle_event(bounds, event, context);
         }
 
         if matches!(
@@ -725,18 +578,32 @@ impl View for EditView {
                 modifiers
             } if modifiers.shortcut()
         ) {
-            self.open_panel.show();
+            self.document.open();
             context.request_redraw();
             return EventResult::Consumed;
         }
         if matches!(
             event,
             ViewEvent::KeyPressed {
-                key: Key::Character('q' | 'Q' | 'w' | 'W'),
+                key: Key::Character('w' | 'W'),
                 modifiers
             } if modifiers.shortcut()
         ) {
-            request_exit();
+            request_close_key_window();
+            context.request_redraw();
+            return EventResult::Consumed;
+        }
+        if matches!(
+            event,
+            ViewEvent::KeyPressed {
+                key: Key::Character('q' | 'Q'),
+                modifiers
+            } if modifiers.shortcut()
+        ) {
+            if self.document.request_close_with(request_quit) {
+                request_quit();
+            }
+            context.request_redraw();
             return EventResult::Consumed;
         }
 
@@ -783,7 +650,7 @@ impl View for EditView {
                 modifiers
             } if modifiers.shortcut() && modifiers.shift()
         ) {
-            self.save_panel.show();
+            self.document.save_as();
             context.request_redraw();
             return EventResult::Consumed;
         }
@@ -862,7 +729,7 @@ impl View for EditView {
         }
         result = result.merge(self.editor.handle_event(geometry.editor, event, context));
         if self.editor_state.revision() != revision {
-            self.save_status.borrow_mut().take();
+            self.document.clear_status();
             context.request_redraw_in(geometry.footer);
         }
         result
@@ -1037,7 +904,9 @@ mod tests {
     }
 
     #[test]
-    fn atomic_save_preserves_utf8_bom_and_permissions() {
+    fn save_preserves_utf8_bom_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1084,21 +953,22 @@ mod tests {
             persisted: Rc::new(RefCell::new(preferences)),
             save_error: Rc::new(RefCell::new(None)),
         };
-        let view = EditView::new(
-            editor,
-            Rc::new(RefCell::new(DocumentIdentity {
-                display_name: String::from("document.txt"),
+        let document = make_document_controller(
+            DocumentIdentity {
                 file_type: "Plain Text",
                 encoding: "UTF-8",
                 contents: None,
                 path: Some(path.clone()),
                 writes_bom: false,
                 can_save: true,
-            })),
+            },
+            editor.clone(),
+        );
+        let view = EditView::new(
+            editor,
+            document,
             preference_model,
             State::new(false),
-            Rc::new(Cell::new(0)),
-            Rc::new(RefCell::new(None)),
         );
         let theme = Theme::LIGHT;
         let mut text_measurer = TextMeasurer::new();
