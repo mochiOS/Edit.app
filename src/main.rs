@@ -100,7 +100,8 @@ impl App for EditApp {
                     ),
             )
             .menu(
-                ApplicationMenu::new("Edit")
+                ApplicationMenu::standard_edit()
+                    .separator()
                     .item(
                         ApplicationMenuItem::new("Find…", move || {
                             find_state.borrow_mut().visible = true;
