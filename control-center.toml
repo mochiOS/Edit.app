@@ -1,7 +1,0 @@
-format = 1
-
-[[item]]
-id = "open-edit"
-title = "Edit"
-symbol = "pencil"
-action = "open-application"
