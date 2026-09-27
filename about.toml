@@ -8,6 +8,7 @@ icon = "appicon.png"
 
 resources = [
     "appicon.png",
+    "control-center.toml",
 ]
 
 document_roles = ["view", "edit"]
