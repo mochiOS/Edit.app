@@ -6,10 +6,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use appkit::prelude::*;
-use appkit::viewkit::draw_command::DrawCommand;
-use appkit::viewkit::event::{EventContext, EventResult, ViewEvent};
-use appkit::viewkit::view::{Constraints, MeasureContext, PaintContext};
+use appcore::prelude::*;
+use appcore::viewkit::draw_command::DrawCommand;
+use appcore::viewkit::event::{EventContext, EventResult, ViewEvent};
+use appcore::viewkit::view::{Constraints, MeasureContext, PaintContext};
 use preferences::EditorPreferences;
 
 struct EditApp {
@@ -133,7 +133,7 @@ impl App for EditApp {
 
     fn close_requested(&mut self) -> bool {
         self.document
-            .request_close_with(|| appkit::viewkit::close_window(WindowId::PRIMARY))
+            .request_close_with(|| appcore::viewkit::close_window(WindowId::PRIMARY))
     }
 }
 
@@ -330,7 +330,8 @@ fn make_document_controller(
         },
         move |path| {
             let has_bom = save_writes_bom.get();
-            save_document(path, &save_editor.value(), has_bom).map_err(|error| error.to_string())?;
+            save_document(path, &save_editor.value(), has_bom)
+                .map_err(|error| error.to_string())?;
             Ok(DocumentMetadata::new(
                 file_type_for_path(path),
                 if has_bom { "UTF-8 with BOM" } else { "UTF-8" },
@@ -892,8 +893,8 @@ fn main() -> Result<(), ViewKitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use appkit::viewkit::platform::KeyModifiers;
-    use appkit::viewkit::typography::TextMeasurer;
+    use appcore::viewkit::platform::KeyModifiers;
+    use appcore::viewkit::typography::TextMeasurer;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -965,12 +966,7 @@ mod tests {
             },
             editor.clone(),
         );
-        let view = EditView::new(
-            editor,
-            document,
-            preference_model,
-            State::new(false),
-        );
+        let view = EditView::new(editor, document, preference_model, State::new(false));
         let theme = Theme::LIGHT;
         let mut text_measurer = TextMeasurer::new();
         let mut context = EventContext::new(&theme, &theme.typography, &mut text_measurer);
