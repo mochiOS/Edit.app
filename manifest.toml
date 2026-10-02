@@ -43,7 +43,7 @@ symbol = "pencil"
 action = "open-application"
 
 [[binary]]
-path = "/applications/Edit.app/entry.elf"
+path = "/system/applications/Edit.app/entry.elf"
 kind = "application"
 requires = [
     "ipc.client",
