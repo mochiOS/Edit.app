@@ -1,8 +1,8 @@
 mod preferences;
 
 use std::cell::{Cell, RefCell};
+#[cfg(test)]
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -17,6 +17,7 @@ struct EditApp {
     document: DocumentController,
     preferences: EditorPreferenceModel,
     settings_visible: State<bool>,
+    launch_name: Option<String>,
 }
 
 impl App for EditApp {
@@ -24,22 +25,35 @@ impl App for EditApp {
 
     fn new() -> Self {
         let mut document = DocumentIdentity::from_arguments();
+        let startup_path = document.path.take();
+        let launch_name = startup_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned());
         let editor = TextEditorInteractionState::new();
         if let Some(contents) = document.contents.take() {
             editor.set_value(contents);
         }
         let preferences = EditorPreferenceModel::load();
         let document = make_document_controller(document, editor.clone());
+        if let Some(path) = startup_path {
+            document.open_path(path);
+        }
         Self {
             editor,
             document,
             preferences,
             settings_visible: State::new(false),
+            launch_name,
         }
     }
 
     fn window(&self) -> WindowOptions {
-        WindowOptions::new(format!("{} — Edit", self.document.info().display_name))
+        let name = self
+            .launch_name
+            .clone()
+            .unwrap_or_else(|| self.document.info().display_name);
+        WindowOptions::new(format!("{name} — Edit"))
             .size(860.0, 640.0)
             .resizable(true)
     }
@@ -55,7 +69,6 @@ impl App for EditApp {
         let open_document = self.document.clone();
         let save_document = self.document.clone();
         let save_as_document = self.document.clone();
-        let quit_document = self.document.clone();
 
         let find_state = Rc::clone(&view.find_state);
         let find_field = view.find_field_state.clone();
@@ -76,7 +89,7 @@ impl App for EditApp {
                     .separator()
                     .item(
                         ApplicationMenuItem::new("Save", move || {
-                            let _ = save_document.save();
+                            let _ = save_document.request_save();
                         })
                         .shortcut(MenuShortcut::command('s', "Ctrl+S")),
                     )
@@ -91,12 +104,8 @@ impl App for EditApp {
                     )
                     .separator()
                     .item(
-                        ApplicationMenuItem::new("Quit Edit", move || {
-                            if quit_document.request_close_with(request_quit) {
-                                request_quit();
-                            }
-                        })
-                        .shortcut(MenuShortcut::command('q', "Ctrl+Q")),
+                        ApplicationMenuItem::new("Quit Edit", request_quit)
+                            .shortcut(MenuShortcut::command('q', "Ctrl+Q")),
                     ),
             )
             .menu(
@@ -131,9 +140,38 @@ impl App for EditApp {
             )
     }
 
+    fn handle_platform_message_with_handles(
+        &mut self,
+        message: &[u8],
+        handles: &mut [appcore::viewkit::platform::PlatformFileHandle],
+    ) -> bool {
+        match appcore::document::decode_open_message(message, handles) {
+            Ok(Some(document)) => {
+                if let Err(error) = self
+                    .document
+                    .open_file(DocumentFile::from_received(document))
+                {
+                    Alert::new().present_error("The document could not be opened.", error);
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                Alert::new().present_error(
+                    "The document could not be opened.",
+                    format!("Invalid document delivery: {error:?}"),
+                );
+                true
+            }
+        }
+    }
+
     fn close_requested(&mut self) -> bool {
+        self.document.request_close_with(request_quit)
+    }
+    fn close_requested_for_window(&mut self, window: WindowId) -> bool {
         self.document
-            .request_close_with(|| appcore::viewkit::close_window(WindowId::PRIMARY))
+            .request_close_with(move || appcore::viewkit::close_window(window))
     }
 }
 
@@ -171,29 +209,13 @@ impl DocumentIdentity {
         };
 
         let file_type = file_type_for_path(&path);
-        let (contents, encoding, writes_bom, can_save) = match std::fs::read(&path) {
-            Ok(bytes) if bytes.starts_with(&[0xef, 0xbb, 0xbf]) => {
-                match String::from_utf8(bytes[3..].to_vec()) {
-                    Ok(contents) => (Some(contents), "UTF-8 with BOM", true, true),
-                    Err(_) => (None, "Unsupported encoding", false, false),
-                }
-            }
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(contents) => (Some(contents), "UTF-8", false, true),
-                Err(_) => (None, "Unsupported encoding", false, false),
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                (Some(String::new()), "UTF-8", false, true)
-            }
-            Err(_) => (None, "Unavailable", false, false),
-        };
         Self {
             file_type,
-            encoding,
-            contents,
+            encoding: "UTF-8",
+            contents: None,
             path: Some(path),
-            writes_bom,
-            can_save,
+            writes_bom: false,
+            can_save: false,
         }
     }
 }
@@ -269,22 +291,52 @@ fn file_type_for_path(path: &Path) -> &'static str {
     }
 }
 
-fn save_document(path: &Path, contents: &str, writes_bom: bool) -> io::Result<()> {
-    // A Save panel grants this process the selected file, not the surrounding
-    // directory. Write that file directly rather than creating a sibling
-    // temporary file outside the granted scope.
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    if writes_bom {
-        file.write_all(&[0xef, 0xbb, 0xbf])?;
-    }
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()
+struct TextContent {
+    text: String,
+    writes_bom: bool,
 }
-
+struct TextFormat;
+impl DocumentFormat for TextFormat {
+    type Content = TextContent;
+    fn read(&self, file: &DocumentFile) -> Result<(TextContent, DocumentMetadata), String> {
+        // Application limit, not an OS-wide document size specification.
+        let mut bytes = file
+            .read_limited(64 * 1024 * 1024)
+            .map_err(|error| error.to_string())?;
+        let writes_bom = bytes.starts_with(&[0xef, 0xbb, 0xbf]);
+        if writes_bom {
+            bytes.drain(..3);
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| "This file is not valid UTF-8 text.".to_owned())?;
+        let metadata = DocumentMetadata::new(
+            file_type_for_path(file.path()),
+            if writes_bom {
+                "UTF-8 with BOM"
+            } else {
+                "UTF-8"
+            },
+        );
+        Ok((TextContent { text, writes_bom }, metadata))
+    }
+    fn write(&self, file: &DocumentFile, content: TextContent) -> Result<DocumentMetadata, String> {
+        let mut bytes = Vec::new();
+        if content.writes_bom {
+            bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+        }
+        bytes.extend_from_slice(content.text.as_bytes());
+        file.replace_contents(&bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(DocumentMetadata::new(
+            file_type_for_path(file.path()),
+            if content.writes_bom {
+                "UTF-8 with BOM"
+            } else {
+                "UTF-8"
+            },
+        ))
+    }
+}
 fn make_document_controller(
     document: DocumentIdentity,
     editor: TextEditorInteractionState,
@@ -296,48 +348,41 @@ fn make_document_controller(
         None => DocumentInfo::untitled(metadata),
     };
     let writes_bom = Rc::new(Cell::new(document.writes_bom));
-
     let revision_editor = editor.clone();
-    let open_editor = editor.clone();
-    let open_writes_bom = Rc::clone(&writes_bom);
-    let save_editor = editor;
-    let save_writes_bom = Rc::clone(&writes_bom);
-
-    DocumentController::new(
+    let fallback_editor = editor.clone();
+    let snapshot_editor = editor.clone();
+    let snapshot_bom = writes_bom.clone();
+    DocumentController::new_background(
         info,
         None,
         move || revision_editor.revision(),
-        move |path| {
-            let bytes = fs::read(path).map_err(|error| format!("Unable to open: {error}"))?;
-            let (contents, encoding, has_bom) = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-                (
-                    String::from_utf8(bytes[3..].to_vec())
-                        .map_err(|_| String::from("This file is not valid UTF-8 text."))?,
-                    "UTF-8 with BOM",
-                    true,
-                )
-            } else {
-                (
-                    String::from_utf8(bytes)
-                        .map_err(|_| String::from("This file is not valid UTF-8 text."))?,
-                    "UTF-8",
-                    false,
-                )
-            };
-            open_editor.set_value(contents);
-            open_writes_bom.set(has_bom);
-            Ok(DocumentMetadata::new(file_type_for_path(path), encoding))
-        },
-        move |path| {
-            let has_bom = save_writes_bom.get();
-            save_document(path, &save_editor.value(), has_bom)
-                .map_err(|error| error.to_string())?;
-            Ok(DocumentMetadata::new(
-                file_type_for_path(path),
-                if has_bom { "UTF-8 with BOM" } else { "UTF-8" },
-            ))
-        },
+        DocumentIo::new(
+            TextFormat,
+            move || {
+                Ok(TextContent {
+                    text: snapshot_editor.value(),
+                    writes_bom: snapshot_bom.get(),
+                })
+            },
+            move |content| {
+                editor.set_value(content.text);
+                writes_bom.set(content.writes_bom);
+            },
+        ),
     )
+    .unwrap_or_else(|error| {
+        // Fail closed: never fall back to blocking I/O on the UI thread.
+        DocumentController::new(
+            DocumentInfo::untitled(DocumentMetadata::new("Plain Text", "UTF-8")),
+            None,
+            move || fallback_editor.revision(),
+            {
+                let error = error.to_string();
+                move |_| Err(format!("Document workers are unavailable: {error}"))
+            },
+            move |_| Err(format!("Document workers are unavailable: {error}")),
+        )
+    })
 }
 
 #[derive(Default)]
@@ -396,8 +441,8 @@ impl EditView {
         }
     }
 
-    fn save(&self) -> bool {
-        self.document.save()
+    fn save(&self) -> SaveRequest {
+        self.document.request_save()
     }
 
     fn geometry(&self, bounds: Rect, theme: &Theme) -> EditGeometry {
@@ -602,9 +647,7 @@ impl View for EditView {
                 modifiers
             } if modifiers.shortcut()
         ) {
-            if self.document.request_close_with(request_quit) {
-                request_quit();
-            }
+            request_quit();
             context.request_redraw();
             return EventResult::Consumed;
         }
@@ -906,6 +949,25 @@ mod tests {
     }
 
     #[test]
+    fn background_text_format_preserves_bom_and_rejects_invalid_utf8() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("edit-format-{}-{nonce}.txt", std::process::id()));
+        fs::write(&path, b"\xef\xbb\xbfhello").unwrap();
+        let file = DocumentFile::open(&path).unwrap();
+        let (content, metadata) = TextFormat.read(&file).unwrap();
+        assert_eq!(content.text, "hello");
+        assert!(content.writes_bom);
+        assert_eq!(metadata.encoding, "UTF-8 with BOM");
+        file.replace_contents(&[0xff, 0xfe]).unwrap();
+        assert!(TextFormat.read(&file).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn save_preserves_utf8_bom_and_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -920,7 +982,15 @@ mod tests {
         fs::write(&path, b"old").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
 
-        save_document(&path, "new\ntext", true).unwrap();
+        TextFormat
+            .write(
+                &DocumentFile::create(&path).unwrap(),
+                TextContent {
+                    text: "new\ntext".into(),
+                    writes_bom: true,
+                },
+            )
+            .unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbfnew\ntext");
         assert_eq!(
@@ -981,7 +1051,11 @@ mod tests {
         );
 
         assert_eq!(result, EventResult::Consumed);
-        assert_eq!(fs::read_to_string(path).unwrap(), "saved from shortcut");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fs::read_to_string(&path).unwrap_or_default() != "saved from shortcut" {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }
