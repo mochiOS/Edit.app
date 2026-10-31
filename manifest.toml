@@ -15,7 +15,11 @@ abi = "mochios-1"
 entry = "entry.elf"
 description = "Plain text editor"
 icon = "appicon.png"
-resources = ["appicon.png"]
+resources = [
+    "appicon.png", "icons/text.svg", "icons/c.svg", "icons/cpp.svg",
+    "icons/rust.svg", "icons/markdown.svg", "icons/json.svg",
+]
+document_icon = "icons/text.svg"
 document_roles = ["view", "edit"]
 document_content_types = [
     "text/plain",
@@ -35,6 +39,31 @@ document_extensions = [
     "yaml", "yml", "log", "ini", "conf", "cfg", "c", "h", "cc",
     "cpp", "cxx", "hh", "hpp", "rs", "sh",
 ]
+
+[[application.document_icons]]
+extensions = ["c", "h"]
+content_types = ["text/x-c"]
+resource = "icons/c.svg"
+
+[[application.document_icons]]
+extensions = ["cc", "cpp", "cxx", "hh", "hpp"]
+content_types = ["text/x-c++"]
+resource = "icons/cpp.svg"
+
+[[application.document_icons]]
+extensions = ["rs"]
+content_types = ["text/x-rust"]
+resource = "icons/rust.svg"
+
+[[application.document_icons]]
+extensions = ["md", "markdown"]
+content_types = ["text/markdown"]
+resource = "icons/markdown.svg"
+
+[[application.document_icons]]
+extensions = ["json"]
+content_types = ["application/json"]
+resource = "icons/json.svg"
 
 [[application.control_center_items]]
 id = "open-edit"

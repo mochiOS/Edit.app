@@ -941,6 +941,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn declared_document_icons_decode_and_rasterize() {
+        for data in [
+            include_bytes!("../resources/icons/text.svg").as_slice(),
+            include_bytes!("../resources/icons/c.svg").as_slice(),
+            include_bytes!("../resources/icons/cpp.svg").as_slice(),
+            include_bytes!("../resources/icons/rust.svg").as_slice(),
+            include_bytes!("../resources/icons/markdown.svg").as_slice(),
+            include_bytes!("../resources/icons/json.svg").as_slice(),
+        ] {
+            let svg = appcore::viewkit::svg::SvgData::decode(data).unwrap();
+            let image = appcore::viewkit::image::ImageData::from_svg(&svg, 72, 72).unwrap();
+            assert_eq!(image.width(), 72);
+        }
+    }
+
+    #[test]
     fn recognizes_structured_text_types() {
         assert_eq!(file_type_for_path(Path::new("settings.json")), "JSON");
         assert_eq!(file_type_for_path(Path::new("version.toml")), "TOML");
