@@ -19,6 +19,7 @@ resources = [
     "appicon.png", "icons/text.svg", "icons/c.svg", "icons/cpp.svg",
     "icons/rust.svg", "icons/markdown.svg", "icons/json.svg",
 ]
+preview = true
 document_icon = "icons/text.svg"
 document_roles = ["view", "edit"]
 document_content_types = [

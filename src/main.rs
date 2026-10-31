@@ -1,4 +1,5 @@
 mod preferences;
+mod preview;
 
 use std::cell::{Cell, RefCell};
 #[cfg(test)]
@@ -930,6 +931,14 @@ fn vertically_centered_text(bounds: Rect, role: TextRole, context: &PaintContext
 }
 
 fn main() -> Result<(), ViewKitError> {
+    match appcore::document::preview::serve(preview::generate) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("Preview failed: {error}");
+            std::process::exit(1);
+        }
+    }
     run::<EditApp>()
 }
 
