@@ -10,7 +10,19 @@ document, `Ctrl+,` opens editor settings, `Ctrl+W` closes the window, and
 Save, Save As and prevents replacing or closing an edited document without an
 explicit Save, Don't Save or Cancel decision.
 
+The editing area uses the standard pane surface. The find bar uses ViewKit's
+`Toolbar` and measured field/result layout; the footer uses a shared sidebar
+surface and single-line native stack labels, so document status and statistics
+do not paint over one another in narrow windows. Editor settings use
+`ActionToolbar`, compact settings rows and a scrollable pane. The custom
+chrome separators are removed. The editor, document controller and file format
+remain responsible for editing, save confirmation and document I/O.
+
 Editor preferences are stored per user under
 `/var/config/applications/org.mochios.edit/users`; they are never written into
-the user's home directory. Files and Binder still need to connect their file
-association launch flow to the existing document-path contract.
+the user's home directory. Edit accepts document paths at launch and
+capability-backed document delivery through AppCore.
+
+Tests cover UTF-8/BOM and permission preservation, atomic preferences, saving
+through the keyboard shortcut, find navigation, focus/field geometry, footer
+label bounds in both themes and the settings Done action in a short window.

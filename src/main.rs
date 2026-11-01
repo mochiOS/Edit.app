@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use appcore::prelude::*;
-use appcore::viewkit::draw_command::DrawCommand;
 use appcore::viewkit::event::{EventContext, EventResult, ViewEvent};
 use appcore::viewkit::view::{Constraints, MeasureContext, PaintContext};
 use preferences::EditorPreferences;
@@ -397,7 +396,7 @@ struct EditView {
     editor_state: TextEditorInteractionState,
     editor: TextEditor,
     find_field_state: TextFieldInteractionState,
-    find_field: TextField,
+    find_field: Rc<TextField>,
     find_state: Rc<RefCell<FindState>>,
     document: DocumentController,
     preferences: EditorPreferenceModel,
@@ -410,7 +409,6 @@ struct EditGeometry {
     editor: Rect,
     find_bar: Option<Rect>,
     find_field: Rect,
-    find_result: Rect,
     footer: Rect,
 }
 
@@ -430,9 +428,11 @@ impl EditView {
                 .line_wrap(preferences.line_wrap.get())
                 .font_size(preferences.font_size.get()),
             editor_state,
-            find_field: TextField::with_interaction(find_field_state.clone())
-                .placeholder("Find")
-                .size(TextFieldSize::Small),
+            find_field: Rc::new(
+                TextField::with_interaction(find_field_state.clone())
+                    .placeholder("Find")
+                    .size(TextFieldSize::Small),
+            ),
             find_field_state,
             find_state: Rc::new(RefCell::new(FindState::default())),
             document,
@@ -471,7 +471,7 @@ impl EditView {
                 find_height,
             )
         });
-        let horizontal = theme.spacing.large;
+        let horizontal = theme.spacing.extra_large;
         let field_height = theme.layout.compact_control_height.min(find_height);
         let field_width = (bounds.size.width * 0.42)
             .clamp(180.0, 360.0)
@@ -480,17 +480,6 @@ impl EditView {
             bounds.origin.x + horizontal,
             bounds.origin.y + (find_height - field_height) / 2.0,
             field_width,
-            field_height,
-        );
-        let find_result = Rect::new(
-            find_field.origin.x + find_field.size.width + theme.spacing.medium,
-            find_field.origin.y,
-            (bounds.origin.x + bounds.size.width
-                - horizontal
-                - find_field.origin.x
-                - find_field.size.width
-                - theme.spacing.medium)
-                .max(0.0),
             field_height,
         );
         let editor = Rect::new(
@@ -503,9 +492,73 @@ impl EditView {
             editor,
             find_bar,
             find_field,
-            find_result,
             footer,
         }
+    }
+
+    fn find_bar(&self, geometry: EditGeometry) -> Toolbar<HStack> {
+        Toolbar::new(
+            HStack::new()
+                .alignment(StackAlignment::Center)
+                .gap(StackGap::Medium)
+                .child(self.find_field.clone().frame(
+                    geometry.find_field.size.width,
+                    geometry.find_field.size.height,
+                ))
+                .child(
+                    Text::metadata(self.find_result_label())
+                        .single_line(true)
+                        .layout()
+                        .flex_grow(1.0)
+                        .flex_shrink(1.0),
+                ),
+        )
+    }
+
+    fn status_bar(&self) -> HStack {
+        let document = self.document.info();
+        let mut file_status = document.metadata.file_type.clone();
+        if let Some(status) = self.document.status() {
+            file_status.push_str("    ");
+            file_status.push_str(&status);
+        } else if self.document.is_edited() {
+            file_status.push_str("    Edited");
+        }
+        let (lines, characters) = self.editor_state.statistics();
+        let character_label = if characters == 1 {
+            "character"
+        } else {
+            "characters"
+        };
+        let statistics = if self.preferences.show_line_count.get() {
+            let line_label = if lines == 1 { "line" } else { "lines" };
+            format!(
+                "{}    {} {}    {} {}",
+                document.metadata.encoding, lines, line_label, characters, character_label
+            )
+        } else {
+            format!(
+                "{}    {} {}",
+                document.metadata.encoding, characters, character_label
+            )
+        };
+        HStack::new()
+            .alignment(StackAlignment::Center)
+            .gap(StackGap::Large)
+            .child(
+                Text::metadata(file_status)
+                    .single_line(true)
+                    .layout()
+                    .flex_grow(1.0)
+                    .flex_shrink(1.0),
+            )
+            .child(
+                Text::metadata(statistics)
+                    .single_line(true)
+                    .alignment(TextAlignment::End)
+                    .layout()
+                    .flex_shrink(1.0),
+            )
     }
 
     fn update_find_result(&self, backwards: bool, from_start: bool) {
@@ -542,68 +595,20 @@ impl View for EditView {
             return;
         }
         let geometry = self.geometry(bounds, context.theme);
-        Rectangle::new()
-            .color(RectangleColor::Custom(context.theme.colors.surface))
-            .paint(bounds, context);
-        self.editor.paint(geometry.editor, context);
-
+        Surface::app().paint(bounds, context);
+        Surface::pane()
+            .in_container(bounds)
+            .paint_content(geometry.editor, context, |context| {
+                self.editor.paint(geometry.editor, context);
+            });
         if let Some(find_bar) = geometry.find_bar {
-            Rectangle::new()
-                .color(RectangleColor::Custom(context.theme.colors.surface_subtle))
-                .paint(find_bar, context);
-            self.find_field.paint(geometry.find_field, context);
-            let result_bounds =
-                vertically_centered_text(geometry.find_result, TextRole::Caption, context);
-            Text::metadata(self.find_result_label()).paint(result_bounds, context);
-            paint_top_or_bottom_divider(find_bar, false, context);
+            self.find_bar(geometry).paint(find_bar, context);
         }
-
-        Rectangle::new()
-            .color(RectangleColor::Custom(context.theme.colors.surface_subtle))
+        Surface::sidebar()
+            .content(
+                Padding::symmetric(context.theme.spacing.large, 0.0).content(self.status_bar()),
+            )
             .paint(geometry.footer, context);
-        paint_top_or_bottom_divider(geometry.footer, true, context);
-
-        let horizontal = context.theme.spacing.large;
-        let footer_text = vertically_centered_text(
-            Rect::new(
-                geometry.footer.origin.x + horizontal,
-                geometry.footer.origin.y,
-                (geometry.footer.size.width - horizontal * 2.0).max(0.0),
-                geometry.footer.size.height,
-            ),
-            TextRole::Caption,
-            context,
-        );
-        let document = self.document.info();
-        let mut file_status = document.metadata.file_type.clone();
-        if let Some(status) = self.document.status() {
-            file_status.push_str("    ");
-            file_status.push_str(&status);
-        } else if self.document.is_edited() {
-            file_status.push_str("    Edited");
-        }
-        Text::metadata(file_status).paint(footer_text, context);
-        let (lines, characters) = self.editor_state.statistics();
-        let character_label = if characters == 1 {
-            "character"
-        } else {
-            "characters"
-        };
-        let statistics = if self.preferences.show_line_count.get() {
-            let line_label = if lines == 1 { "line" } else { "lines" };
-            format!(
-                "{}    {} {}    {} {}",
-                document.metadata.encoding, lines, line_label, characters, character_label
-            )
-        } else {
-            format!(
-                "{}    {} {}",
-                document.metadata.encoding, characters, character_label
-            )
-        };
-        Text::metadata(statistics)
-            .alignment(TextAlignment::End)
-            .paint(footer_text, context);
         if self.document.is_presenting() {
             self.document.paint(bounds, context);
         }
@@ -762,8 +767,8 @@ impl View for EditView {
         let revision = self.editor_state.revision();
         let mut result = EventResult::Ignored;
         if self.find_state.borrow().visible {
-            result = result.merge(self.find_field.handle_event(
-                geometry.find_field,
+            result = result.merge(self.find_bar(geometry).handle_event(
+                geometry.find_bar.unwrap(),
                 event,
                 context,
             ));
@@ -773,7 +778,12 @@ impl View for EditView {
                 context.request_redraw();
             }
         }
-        result = result.merge(self.editor.handle_event(geometry.editor, event, context));
+        result = result.merge(Surface::pane().in_container(bounds).handle_content_event(
+            geometry.editor,
+            event,
+            context,
+            |event, context| self.editor.handle_event(geometry.editor, event, context),
+        ));
         if self.editor_state.revision() != revision {
             self.document.clear_status();
             context.request_redraw_in(geometry.footer);
@@ -783,8 +793,11 @@ impl View for EditView {
 }
 
 struct EditSettingsView {
-    page: SettingsPage<FormSections>,
-    done: Button,
+    page: Rc<SettingsPage<FormSections>>,
+    done: ButtonInteractionState,
+    toolbar: ActionToolbarState<()>,
+    visible: State<bool>,
+    scroll: ScrollState,
     preferences: EditorPreferenceModel,
 }
 
@@ -812,10 +825,12 @@ impl EditSettingsView {
                             "Line Wrapping",
                             Switch::new(preferences.line_wrap.binding()),
                         )
+                        .compact()
                         .description("Wrap long lines to the width of the window"),
                     )
                     .row(
                         SettingsRow::new("Text Size", font_control)
+                            .compact()
                             .description("Size of document text"),
                     ),
             )
@@ -825,41 +840,59 @@ impl EditSettingsView {
                         "Show Line Count",
                         Switch::new(preferences.show_line_count.binding()),
                     )
+                    .compact()
                     .description("Show the number of lines in the document footer"),
                 ),
             );
-        let done = Button::new("Done")
-            .size(ButtonSize::Small)
-            .style(ButtonStyle::Ghost)
-            .on_click(move || visible.set(false));
         Self {
-            page,
-            done,
+            page: Rc::new(page),
+            done: ButtonInteractionState::new(),
+            toolbar: ActionToolbarState::new(),
+            visible,
+            scroll: ScrollState::new(),
             preferences,
         }
     }
 
-    fn geometry(bounds: Rect, theme: &Theme) -> (Rect, Rect, Rect) {
-        let bar_height = theme.layout.top_bar_height.min(bounds.size.height);
-        let bar = Rect::new(
-            bounds.origin.x,
-            bounds.origin.y,
-            bounds.size.width,
-            bar_height,
-        );
-        let done = Rect::new(
-            bounds.origin.x + bounds.size.width - theme.spacing.large - 72.0,
-            bounds.origin.y + (bar_height - theme.layout.compact_control_height) / 2.0,
-            72.0,
-            theme.layout.compact_control_height,
-        );
-        let content = Rect::new(
-            bounds.origin.x + theme.spacing.extra_large,
-            bounds.origin.y + bar_height + theme.spacing.extra_large,
-            (bounds.size.width - theme.spacing.extra_large * 2.0).max(0.0),
-            (bounds.size.height - bar_height - theme.spacing.extra_large * 2.0).max(0.0),
-        );
-        (bar, done, content)
+    fn content(&self) -> VStack {
+        let visible = self.visible.clone();
+        let actions = ActionToolbar::new(self.toolbar.clone())
+            .title("Settings")
+            .trailing(
+                (),
+                Button::with_interaction_and_label(self.done.clone(), "Done")
+                    .on_click(move || visible.set(false)),
+            );
+        let mut content = VStack::new()
+            .alignment(StackAlignment::Stretch)
+            .gap(StackGap::None)
+            .child(Toolbar::new(actions))
+            .child(
+                Surface::pane()
+                    .content(
+                        Scroll::new(self.scroll.clone())
+                            .axis(ScrollAxis::Vertical)
+                            .content(
+                                Padding::all(Theme::current().spacing.extra_large)
+                                    .content(self.page.clone()),
+                            ),
+                    )
+                    .layout()
+                    .flex_grow(1.0)
+                    .flex_shrink(1.0),
+            );
+        if let Some(error) = self.preferences.save_error.borrow().as_ref() {
+            content = content.child(
+                Padding::symmetric(
+                    Theme::current().spacing.large,
+                    Theme::current().spacing.small,
+                )
+                .content(Text::metadata(error.clone()).color(Theme::current().colors.destructive))
+                .layout()
+                .flex_shrink(0.0),
+            );
+        }
+        content
     }
 }
 
@@ -867,67 +900,21 @@ impl View for EditSettingsView {
     fn measure(&self, constraints: Constraints, _context: &mut MeasureContext<'_>) -> Size {
         constraints.constrain(constraints.maximum)
     }
-
     fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
-        let (bar, done, content) = Self::geometry(bounds, context.theme);
-        Rectangle::new()
-            .color(RectangleColor::Custom(context.theme.colors.surface))
+        Surface::app()
+            .content(self.content())
             .paint(bounds, context);
-        let title = vertically_centered_text(bar, TextRole::Label, context);
-        Text::label("Settings")
-            .weight(600)
-            .alignment(TextAlignment::Center)
-            .paint(title, context);
-        self.done.paint(done, context);
-        paint_top_or_bottom_divider(bar, false, context);
-        self.page.paint(content, context);
-
-        if let Some(error) = self.preferences.save_error.borrow().as_ref() {
-            let status = Rect::new(
-                content.origin.x,
-                bounds.origin.y + bounds.size.height - context.theme.layout.status_bar_height,
-                content.size.width,
-                context.theme.layout.status_bar_height,
-            );
-            Text::metadata(error.clone()).paint(status, context);
-        }
     }
-
     fn handle_event(
         &self,
         bounds: Rect,
         event: &ViewEvent,
         context: &mut EventContext<'_>,
     ) -> EventResult {
-        let (_, done, content) = Self::geometry(bounds, context.theme());
-        self.done
-            .handle_event(done, event, context)
-            .merge(self.page.handle_event(content, event, context))
+        Surface::app()
+            .content(self.content())
+            .handle_event(bounds, event, context)
     }
-}
-
-fn paint_top_or_bottom_divider(bounds: Rect, top: bool, context: &mut PaintContext<'_>) {
-    let thickness = context.theme.divider.thickness.max(1.0);
-    let y = if top {
-        bounds.origin.y
-    } else {
-        bounds.origin.y + (bounds.size.height - thickness).max(0.0)
-    };
-    context.display_list.push(DrawCommand::FillRect {
-        rect: Rect::new(bounds.origin.x, y, bounds.size.width, thickness),
-        color: context.theme.colors.border,
-    });
-}
-
-fn vertically_centered_text(bounds: Rect, role: TextRole, context: &PaintContext<'_>) -> Rect {
-    let line_height =
-        context.typography.style(role).line_height * context.text_measurer.font_scale();
-    Rect::new(
-        bounds.origin.x,
-        bounds.origin.y + ((bounds.size.height - line_height) / 2.0).max(0.0),
-        bounds.size.width,
-        line_height.min(bounds.size.height),
-    )
 }
 
 fn main() -> Result<(), ViewKitError> {
@@ -1082,5 +1069,161 @@ mod tests {
             std::thread::yield_now();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+    fn fixture_view() -> EditView {
+        let editor = TextEditorInteractionState::new();
+        editor.set_value("alpha βeta alpha");
+        editor.focus();
+        let preferences = EditorPreferences::default();
+        let model = EditorPreferenceModel {
+            line_wrap: State::new(preferences.line_wrap),
+            show_line_count: State::new(preferences.show_line_count),
+            font_size: State::new(preferences.font_size),
+            persisted: Rc::new(RefCell::new(preferences)),
+            save_error: Rc::new(RefCell::new(None)),
+        };
+        let document = make_document_controller(
+            DocumentIdentity {
+                file_type: "Plain Text",
+                encoding: "UTF-8",
+                contents: None,
+                path: None,
+                writes_bom: false,
+                can_save: false,
+            },
+            editor.clone(),
+        );
+        EditView::new(editor, document, model, State::new(false))
+    }
+
+    fn snapshot(
+        view: &EditView,
+        bounds: Rect,
+        theme: &Theme,
+    ) -> Vec<appcore::viewkit::accessibility::AccessibilityNode> {
+        let mut list = appcore::viewkit::draw_command::DisplayList::new();
+        let mut nodes = Vec::new();
+        let mut text = TextMeasurer::new();
+        view.paint(
+            bounds,
+            &mut PaintContext::new(&mut list, theme, &theme.typography, &mut text)
+                .with_accessibility_nodes(&mut nodes),
+        );
+        nodes
+    }
+
+    #[test]
+    fn native_find_bar_preserves_search_navigation_and_document_contents() {
+        let view = fixture_view();
+        let bounds = Rect::new(0.0, 0.0, 800.0, 600.0);
+        let theme = Theme::LIGHT;
+        let mut text = TextMeasurer::new();
+        let mut context = EventContext::new(&theme, &theme.typography, &mut text);
+        view.handle_event(
+            bounds,
+            &ViewEvent::KeyPressed {
+                key: Key::Character('f'),
+                modifiers: KeyModifiers::from_bits(KeyModifiers::CONTROL),
+            },
+            &mut context,
+        );
+        assert!(view.find_state.borrow().visible);
+        assert!(view.find_field_state.is_focused());
+        view.handle_event(
+            bounds,
+            &ViewEvent::TextInput {
+                text: "alpha".into(),
+            },
+            &mut context,
+        );
+        assert_eq!(view.find_state.borrow().result, Some((1, 2)));
+        view.handle_event(
+            bounds,
+            &ViewEvent::KeyPressed {
+                key: Key::Enter,
+                modifiers: KeyModifiers::default(),
+            },
+            &mut context,
+        );
+        assert_eq!(view.find_state.borrow().result, Some((2, 2)));
+        view.handle_event(
+            bounds,
+            &ViewEvent::KeyPressed {
+                key: Key::Escape,
+                modifiers: KeyModifiers::default(),
+            },
+            &mut context,
+        );
+        assert!(!view.find_state.borrow().visible);
+        assert_eq!(view.editor_state.value(), "alpha βeta alpha");
+    }
+
+    #[test]
+    fn native_find_geometry_matches_focus_and_footer_labels_do_not_overlap() {
+        let view = fixture_view();
+        view.find_state.borrow_mut().visible = true;
+        for theme in [Theme::LIGHT, Theme::DARK] {
+            for width in [240.0, 360.0, 800.0] {
+                let bounds = Rect::new(0.0, 0.0, width, 600.0);
+                let geometry = view.geometry(bounds, &theme);
+                let nodes = snapshot(&view, bounds, &theme);
+                let field = nodes
+                    .iter()
+                    .find(|n| {
+                        n.label.as_deref() == Some("Find") && n.role == AccessibilityRole::TextField
+                    })
+                    .unwrap();
+                assert_eq!(field.bounds, geometry.find_field);
+                let labels: Vec<_> = nodes
+                    .iter()
+                    .filter(|n| {
+                        n.role == AccessibilityRole::StaticText
+                            && n.bounds.origin.y >= geometry.footer.origin.y
+                    })
+                    .collect();
+                assert_eq!(labels.len(), 2);
+                assert!(labels[0].bounds.intersection(labels[1].bounds).is_none());
+                for label in labels {
+                    assert!(label.bounds.origin.x >= 0.0);
+                    assert!(label.bounds.origin.x + label.bounds.size.width <= width + 0.01);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_settings_window_keeps_done_reachable_and_preserves_document() {
+        use appcore::viewkit::platform::PointerButton;
+        let view = fixture_view();
+        view.settings_visible.set(true);
+        let bounds = Rect::new(0.0, 0.0, 360.0, 320.0);
+        let theme = Theme::LIGHT;
+        let nodes = snapshot(&view, bounds, &theme);
+        let done = nodes
+            .iter()
+            .find(|n| n.label.as_deref() == Some("Done") && n.role == AccessibilityRole::Button)
+            .unwrap()
+            .bounds;
+        assert!(done.origin.y + done.size.height <= theme.layout.top_bar_height);
+        let position = Point::new(
+            done.origin.x + done.size.width * 0.5,
+            done.origin.y + done.size.height * 0.5,
+        );
+        let mut text = TextMeasurer::new();
+        let mut context = EventContext::new(&theme, &theme.typography, &mut text);
+        for event in [
+            ViewEvent::PointerPressed {
+                position,
+                button: PointerButton::Primary,
+            },
+            ViewEvent::PointerReleased {
+                position,
+                button: PointerButton::Primary,
+            },
+        ] {
+            view.handle_event(bounds, &event, &mut context);
+        }
+        assert!(!view.settings_visible.get());
+        assert_eq!(view.editor_state.value(), "alpha βeta alpha");
     }
 }
