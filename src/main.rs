@@ -113,7 +113,9 @@ impl App for EditApp {
                     .separator()
                     .item(
                         ApplicationMenuItem::new("Find…", move || {
-                            find_state.borrow_mut().visible = true;
+                            let mut state = find_state.borrow_mut();
+                            state.visible = true;
+                            state.request_focus(EditFocus::Find);
                             find_field.set_focused(true);
                         })
                         .shortcut(MenuShortcut::command('f', "Ctrl+F")),
@@ -129,7 +131,13 @@ impl App for EditApp {
                     .item(
                         ApplicationMenuItem::new("Show Find Bar", move || {
                             let visible = !show_find_state.borrow().visible;
-                            show_find_state.borrow_mut().visible = visible;
+                            let mut state = show_find_state.borrow_mut();
+                            state.visible = visible;
+                            state.request_focus(if visible {
+                                EditFocus::Find
+                            } else {
+                                EditFocus::Editor
+                            });
                             show_find_field.set_focused(visible);
                         })
                         .checked_when(move || find_checked.borrow().visible),
@@ -385,16 +393,30 @@ fn make_document_controller(
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditFocus {
+    Editor,
+    Find,
+}
+
 #[derive(Default)]
 struct FindState {
     visible: bool,
     last_query: String,
     result: Option<(usize, usize)>,
+    focus_after_layout: Option<EditFocus>,
+    focus_bounds: Option<Rect>,
+}
+impl FindState {
+    fn request_focus(&mut self, target: EditFocus) {
+        self.focus_after_layout = Some(target);
+        self.focus_bounds = None;
+    }
 }
 
 struct EditView {
     editor_state: TextEditorInteractionState,
-    editor: TextEditor,
+    editor: Rc<TextEditor>,
     find_field_state: TextFieldInteractionState,
     find_field: Rc<TextField>,
     find_state: Rc<RefCell<FindState>>,
@@ -402,14 +424,45 @@ struct EditView {
     preferences: EditorPreferenceModel,
     settings_visible: State<bool>,
     settings: EditSettingsView,
+    editor_bounds: Rc<Cell<Option<Rect>>>,
+    footer_bounds: Rc<Cell<Option<Rect>>>,
 }
 
-#[derive(Clone, Copy)]
-struct EditGeometry {
-    editor: Rect,
-    find_bar: Option<Rect>,
-    find_field: Rect,
-    footer: Rect,
+// Observe the bounds assigned by ViewKit; never compute a second layout for
+// focus requests or partial status redraws.
+struct LayoutBounds<V> {
+    content: V,
+    bounds: Option<Rc<Cell<Option<Rect>>>>,
+    focus: Option<EditFocus>,
+    find_state: Rc<RefCell<FindState>>,
+}
+impl<V: View> View for LayoutBounds<V> {
+    fn measure(&self, constraints: Constraints, context: &mut MeasureContext<'_>) -> Size {
+        self.content.measure(constraints, context)
+    }
+    fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
+        if let Some(record) = &self.bounds {
+            record.set(Some(bounds));
+        }
+        if let Some(target) = self.focus {
+            let mut state = self.find_state.borrow_mut();
+            if state.focus_after_layout == Some(target) {
+                state.focus_bounds = Some(bounds);
+            }
+        }
+        self.content.paint(bounds, context);
+    }
+    fn handle_event(
+        &self,
+        bounds: Rect,
+        event: &ViewEvent,
+        context: &mut EventContext<'_>,
+    ) -> EventResult {
+        if let Some(record) = &self.bounds {
+            record.set(Some(bounds));
+        }
+        self.content.handle_event(bounds, event, context)
+    }
 }
 
 impl EditView {
@@ -422,11 +475,13 @@ impl EditView {
         let find_field_state = TextFieldInteractionState::new();
         let settings = EditSettingsView::new(preferences.clone(), settings_visible.clone());
         Self {
-            editor: TextEditor::with_interaction(editor_state.clone())
-                .placeholder("Start typing")
-                .monospaced(true)
-                .line_wrap(preferences.line_wrap.get())
-                .font_size(preferences.font_size.get()),
+            editor: Rc::new(
+                TextEditor::with_interaction(editor_state.clone())
+                    .placeholder("Start typing")
+                    .monospaced(true)
+                    .line_wrap(preferences.line_wrap.get())
+                    .font_size(preferences.font_size.get()),
+            ),
             editor_state,
             find_field: Rc::new(
                 TextField::with_interaction(find_field_state.clone())
@@ -439,6 +494,8 @@ impl EditView {
             preferences,
             settings_visible,
             settings,
+            editor_bounds: Rc::new(Cell::new(None)),
+            footer_bounds: Rc::new(Cell::new(None)),
         }
     }
 
@@ -446,65 +503,20 @@ impl EditView {
         self.document.request_save()
     }
 
-    fn geometry(&self, bounds: Rect, theme: &Theme) -> EditGeometry {
-        let footer_height = theme.layout.status_bar_height.min(bounds.size.height);
-        let footer = Rect::new(
-            bounds.origin.x,
-            bounds.origin.y + (bounds.size.height - footer_height).max(0.0),
-            bounds.size.width,
-            footer_height,
-        );
-        let find_visible = self.find_state.borrow().visible;
-        let find_height = if find_visible {
-            theme
-                .layout
-                .top_bar_height
-                .min((bounds.size.height - footer_height).max(0.0))
-        } else {
-            0.0
-        };
-        let find_bar = find_visible.then(|| {
-            Rect::new(
-                bounds.origin.x,
-                bounds.origin.y,
-                bounds.size.width,
-                find_height,
-            )
-        });
-        let horizontal = theme.spacing.extra_large;
-        let field_height = theme.layout.compact_control_height.min(find_height);
-        let field_width = (bounds.size.width * 0.42)
-            .clamp(180.0, 360.0)
-            .min((bounds.size.width - horizontal * 2.0).max(0.0));
-        let find_field = Rect::new(
-            bounds.origin.x + horizontal,
-            bounds.origin.y + (find_height - field_height) / 2.0,
-            field_width,
-            field_height,
-        );
-        let editor = Rect::new(
-            bounds.origin.x,
-            bounds.origin.y + find_height,
-            bounds.size.width,
-            (bounds.size.height - footer_height - find_height).max(0.0),
-        );
-        EditGeometry {
-            editor,
-            find_bar,
-            find_field,
-            footer,
-        }
-    }
-
-    fn find_bar(&self, geometry: EditGeometry) -> Toolbar<HStack> {
+    fn find_bar(&self, theme: &Theme) -> Toolbar<HStack> {
         Toolbar::new(
             HStack::new()
                 .alignment(StackAlignment::Center)
                 .gap(StackGap::Medium)
-                .child(self.find_field.clone().frame(
-                    geometry.find_field.size.width,
-                    geometry.find_field.size.height,
-                ))
+                .child(
+                    LayoutBounds {
+                        content: self.find_field.clone(),
+                        bounds: None,
+                        focus: Some(EditFocus::Find),
+                        find_state: self.find_state.clone(),
+                    }
+                    .width(theme.layout.form_control_width),
+                )
                 .child(
                     Text::metadata(self.find_result_label())
                         .single_line(true)
@@ -513,6 +525,47 @@ impl EditView {
                         .flex_shrink(1.0),
                 ),
         )
+    }
+
+    fn content(&self, theme: &Theme) -> Surface<VStack> {
+        let mut layout = VStack::new()
+            .alignment(StackAlignment::Stretch)
+            .gap(StackGap::None);
+        if self.find_state.borrow().visible {
+            layout = layout.child(self.find_bar(theme).layout().flex_shrink(0.0));
+        }
+        layout = layout.child(
+            Surface::pane()
+                .content(LayoutBounds {
+                    content: self.editor.clone(),
+                    bounds: Some(self.editor_bounds.clone()),
+                    focus: Some(EditFocus::Editor),
+                    find_state: self.find_state.clone(),
+                })
+                .layout()
+                .flex_grow(1.0),
+        );
+        let footer = Surface::sidebar()
+            .content(Padding::symmetric(theme.spacing.large, 0.0).content(self.status_bar()));
+        layout = layout.child(
+            LayoutBounds {
+                content: footer,
+                bounds: Some(self.footer_bounds.clone()),
+                focus: None,
+                find_state: self.find_state.clone(),
+            }
+            .height(theme.layout.status_bar_height)
+            .flex_shrink(0.0),
+        );
+        Surface::app().content(layout)
+    }
+
+    fn redraw_status(&self, context: &mut EventContext<'_>) {
+        if let Some(bounds) = self.footer_bounds.get() {
+            context.request_redraw_in(bounds);
+        } else {
+            context.request_redraw();
+        }
     }
 
     fn status_bar(&self) -> HStack {
@@ -594,21 +647,7 @@ impl View for EditView {
             }
             return;
         }
-        let geometry = self.geometry(bounds, context.theme);
-        Surface::app().paint(bounds, context);
-        Surface::pane()
-            .in_container(bounds)
-            .paint_content(geometry.editor, context, |context| {
-                self.editor.paint(geometry.editor, context);
-            });
-        if let Some(find_bar) = geometry.find_bar {
-            self.find_bar(geometry).paint(find_bar, context);
-        }
-        Surface::sidebar()
-            .content(
-                Padding::symmetric(context.theme.spacing.large, 0.0).content(self.status_bar()),
-            )
-            .paint(geometry.footer, context);
+        self.content(context.theme).paint(bounds, context);
         if self.document.is_presenting() {
             self.document.paint(bounds, context);
         }
@@ -687,11 +726,41 @@ impl View for EditView {
             return result;
         }
 
-        let geometry = self.geometry(bounds, context.theme());
+        if matches!(
+            event,
+            ViewEvent::PointerFocusRequested { .. } | ViewEvent::FocusChanged { focused: false }
+        ) {
+            let mut state = self.find_state.borrow_mut();
+            state.focus_after_layout = None;
+            state.focus_bounds = None;
+        } else if !matches!(event, ViewEvent::KeyboardFocusRequested { .. }) {
+            // Opening/closing Find changes the editor bounds. Wait until paint
+            // has registered the new target in ViewKit's accessibility order;
+            // requesting the old rectangle would lose focus on the next frame.
+            let target = {
+                let mut state = self.find_state.borrow_mut();
+                let bounds = state.focus_bounds.take();
+                if bounds.is_some() {
+                    state.focus_after_layout = None;
+                }
+                bounds
+            };
+            if let Some(target) = target {
+                self.content(context.theme()).handle_event(
+                    bounds,
+                    &ViewEvent::KeyboardFocusRequested {
+                        bounds: Some(target),
+                    },
+                    context,
+                );
+                context.request_keyboard_focus(target);
+            }
+        }
+
         if matches!(event, ViewEvent::FocusChanged { focused: true })
             && !self.find_state.borrow().visible
         {
-            context.request_keyboard_focus(geometry.editor);
+            context.request_keyboard_focus(self.editor_bounds.get().unwrap_or(bounds));
         }
 
         if matches!(
@@ -713,7 +782,7 @@ impl View for EditView {
             } if modifiers.shortcut()
         ) {
             let _ = self.save();
-            context.request_redraw_in(geometry.footer);
+            self.redraw_status(context);
             return EventResult::Consumed;
         }
         if matches!(
@@ -723,13 +792,15 @@ impl View for EditView {
                 modifiers
             } if modifiers.shortcut()
         ) {
-            self.find_state.borrow_mut().visible = true;
+            {
+                let mut state = self.find_state.borrow_mut();
+                state.visible = true;
+                state.request_focus(EditFocus::Find);
+            }
             self.find_field_state.set_focused(true);
             let _ = self.editor.handle_event(
-                geometry.editor,
-                &ViewEvent::KeyboardFocusRequested {
-                    bounds: Some(geometry.find_field),
-                },
+                self.editor_bounds.get().unwrap_or(bounds),
+                &ViewEvent::KeyboardFocusRequested { bounds: None },
                 context,
             );
             context.request_redraw();
@@ -745,9 +816,13 @@ impl View for EditView {
                 }
             )
         {
-            self.find_state.borrow_mut().visible = false;
+            {
+                let mut state = self.find_state.borrow_mut();
+                state.visible = false;
+                state.request_focus(EditFocus::Editor);
+            }
             self.find_field_state.set_focused(false);
-            context.request_keyboard_focus(geometry.editor);
+            self.editor_state.focus();
             context.request_redraw();
             return EventResult::Consumed;
         }
@@ -765,28 +840,19 @@ impl View for EditView {
         }
 
         let revision = self.editor_state.revision();
-        let mut result = EventResult::Ignored;
+        let result = self
+            .content(context.theme())
+            .handle_event(bounds, event, context);
         if self.find_state.borrow().visible {
-            result = result.merge(self.find_bar(geometry).handle_event(
-                geometry.find_bar.unwrap(),
-                event,
-                context,
-            ));
             let query = self.find_field_state.value();
             if query != self.find_state.borrow().last_query {
                 self.update_find_result(false, true);
                 context.request_redraw();
             }
         }
-        result = result.merge(Surface::pane().in_container(bounds).handle_content_event(
-            geometry.editor,
-            event,
-            context,
-            |event, context| self.editor.handle_event(geometry.editor, event, context),
-        ));
         if self.editor_state.revision() != revision {
             self.document.clear_status();
-            context.request_redraw_in(geometry.footer);
+            self.redraw_status(context);
         }
         result
     }
@@ -1165,7 +1231,6 @@ mod tests {
         for theme in [Theme::LIGHT, Theme::DARK] {
             for width in [240.0, 360.0, 800.0] {
                 let bounds = Rect::new(0.0, 0.0, width, 600.0);
-                let geometry = view.geometry(bounds, &theme);
                 let nodes = snapshot(&view, bounds, &theme);
                 let field = nodes
                     .iter()
@@ -1173,12 +1238,29 @@ mod tests {
                         n.label.as_deref() == Some("Find") && n.role == AccessibilityRole::TextField
                     })
                     .unwrap();
-                assert_eq!(field.bounds, geometry.find_field);
+                let toolbar = nodes
+                    .iter()
+                    .find(|n| n.role == AccessibilityRole::Toolbar)
+                    .unwrap()
+                    .bounds;
+                assert!(field.bounds.origin.x >= toolbar.origin.x);
+                assert!(
+                    field.bounds.origin.x + field.bounds.size.width
+                        <= toolbar.origin.x + toolbar.size.width
+                );
+                assert!(
+                    (field.bounds.origin.y + field.bounds.size.height * 0.5
+                        - toolbar.origin.y
+                        - toolbar.size.height * 0.5)
+                        .abs()
+                        < 0.1
+                );
+                let footer = view.footer_bounds.get().unwrap();
                 let labels: Vec<_> = nodes
                     .iter()
                     .filter(|n| {
                         n.role == AccessibilityRole::StaticText
-                            && n.bounds.origin.y >= geometry.footer.origin.y
+                            && n.bounds.origin.y >= footer.origin.y
                     })
                     .collect();
                 assert_eq!(labels.len(), 2);
@@ -1189,6 +1271,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn standard_stack_keeps_editor_and_chrome_separate_during_resize() {
+        let view = fixture_view();
+        for theme in [Theme::LIGHT, Theme::DARK] {
+            for visible in [false, true] {
+                view.find_state.borrow_mut().visible = visible;
+                for width in [240., 360., 800.] {
+                    for height in [140., 320., 600.] {
+                        let bounds = Rect::new(13., 17., width, height);
+                        let nodes = snapshot(&view, bounds, &theme);
+                        let editor = view.editor_bounds.get().unwrap();
+                        let footer = view.footer_bounds.get().unwrap();
+                        assert!(editor.size.width > 0. && editor.size.height > 0.);
+                        assert!(editor.origin.y >= bounds.origin.y);
+                        assert!(editor.origin.y + editor.size.height <= footer.origin.y + 0.1);
+                        assert!(
+                            (footer.origin.y + footer.size.height - bounds.origin.y - height).abs()
+                                < 0.1
+                        );
+                        let text = nodes
+                            .iter()
+                            .find(|n| n.label.as_deref() == Some("Start typing"))
+                            .unwrap();
+                        assert_eq!(text.bounds, editor);
+                        if visible {
+                            let field = nodes
+                                .iter()
+                                .find(|n| n.label.as_deref() == Some("Find"))
+                                .unwrap();
+                            assert!(
+                                field.bounds.origin.y + field.bounds.size.height
+                                    <= editor.origin.y + 0.1
+                            );
+                        } else {
+                            assert!(!nodes.iter().any(|n| n.label.as_deref() == Some("Find")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_and_escape_restore_focus_after_repaint_through_the_real_dispatcher() {
+        use appcore::viewkit::{event::EventDispatcher, platform::PlatformEvent};
+        let view = fixture_view();
+        let theme = Theme::LIGHT;
+        let bounds = Rect::new(0., 0., 360., 320.);
+        let mut dispatcher = EventDispatcher::new();
+        let mut text = TextMeasurer::new();
+        let mut context = EventContext::new(&theme, &theme.typography, &mut text);
+        dispatcher.set_accessibility_nodes(&snapshot(&view, bounds, &theme));
+        dispatcher.dispatch(&view, bounds, &PlatformEvent::Focused(true), &mut context);
+        dispatcher.dispatch(
+            &view,
+            bounds,
+            &PlatformEvent::KeyPressed {
+                key: Key::Character('f'),
+                modifiers: KeyModifiers::from_bits(KeyModifiers::CONTROL),
+            },
+            &mut context,
+        );
+        dispatcher.set_accessibility_nodes(&snapshot(&view, bounds, &theme));
+        dispatcher.dispatch(
+            &view,
+            bounds,
+            &PlatformEvent::TextInput {
+                text: "alpha".into(),
+            },
+            &mut context,
+        );
+        assert_eq!(view.find_field_state.value(), "alpha");
+        assert_eq!(view.editor_state.value(), "alpha βeta alpha");
+        assert!(view.find_field_state.is_focused());
+        assert!(!view.editor_state.is_focused());
+        dispatcher.dispatch(
+            &view,
+            bounds,
+            &PlatformEvent::KeyPressed {
+                key: Key::Escape,
+                modifiers: KeyModifiers::default(),
+            },
+            &mut context,
+        );
+        dispatcher.set_accessibility_nodes(&snapshot(&view, bounds, &theme));
+        dispatcher.dispatch(
+            &view,
+            bounds,
+            &PlatformEvent::TextInput {
+                text: "replacement".into(),
+            },
+            &mut context,
+        );
+        assert!(view.editor_state.value().contains("replacement"));
+        assert_eq!(view.find_field_state.value(), "alpha");
+        assert!(view.editor_state.is_focused());
+        assert!(!view.find_field_state.is_focused());
     }
 
     #[test]
