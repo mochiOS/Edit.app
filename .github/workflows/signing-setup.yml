@@ -1,0 +1,66 @@
+name: Initialize Edit signing
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful main-branch Build native Edit MPKG run ID
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: edit-signing-initialization
+  cancel-in-progress: false
+jobs:
+  initialize:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    environment: app-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: '4'
+    steps:
+      - name: Download the selected unsigned build (never execute application code)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: edit-unsigned-mpkg
+          path: ${{ runner.temp }}/unsigned-build
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+      - name: Prepare pinned SDK tooling without an application checkout
+        id: sdk
+        uses: mochiOS/devkit/actions/setup-rust-sdk@0f8585fc13691383bebe304633dae8bced8443d1
+        with:
+          output: ${{ runner.temp }}/mochios-rust-sdk
+      - name: Build trusted msign and Kome
+        env:
+          SDK: ${{ steps.sdk.outputs.sdk }}
+          HELPER: ${{ steps.sdk.outputs.helper }}
+        run: |
+          python3 "$(dirname "$HELPER")/host-tool.py" --sdk "$SDK" --tool msign --output "$RUNNER_TEMP/signing-tools"
+          python3 "$(dirname "$HELPER")/host-tool.py" --sdk "$SDK" --tool kome --output "$RUNNER_TEMP/signing-tools"
+      - name: Authorize Kome and save the verified signing identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNING_SETUP_TOKEN: ${{ secrets.SIGNING_SETUP_TOKEN }}
+          MSIGN_SETUP_KEYPAIR_B64: ${{ secrets.MSIGN_SETUP_KEYPAIR_B64 }}
+          APP_RELEASE_ENABLED: ${{ vars.APP_RELEASE_ENABLED }}
+          HELPER: ${{ steps.sdk.outputs.helper }}
+          BUILD_RUN: ${{ inputs.build_run_id }}
+          SETUP_REPOSITORY: ${{ github.repository }}
+          SETUP_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 "$(dirname "$HELPER")/signing-setup.py" \
+            --repository "$SETUP_REPOSITORY" \
+            --environment app-release \
+            --reviewer-team 17892808 \
+            --branch "$SETUP_BRANCH" \
+            --package-id org.mochios.edit \
+            --developer-id 019f9e5ac6687902b0e72fe53abfbef1 \
+            --build-run "$BUILD_RUN" \
+            --build-workflow .github/workflows/package.yml \
+            --sdk-ref 0f8585fc13691383bebe304633dae8bced8443d1 \
+            --artifacts "$RUNNER_TEMP/unsigned-build" \
+            --tools "$RUNNER_TEMP/signing-tools/release"

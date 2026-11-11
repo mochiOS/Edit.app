@@ -12,6 +12,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   build:
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -29,9 +32,23 @@ jobs:
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libfontconfig1-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev unzip curl perl cmake
       - name: Prepare the pinned standalone Rust SDK
         id: sdk
-        uses: mochiOS/devkit/actions/setup-rust-sdk@1ae906d7417e9882b11541e338552c3039c981fb
+        uses: mochiOS/devkit/actions/setup-rust-sdk@0f8585fc13691383bebe304633dae8bced8443d1
         with:
           output: ${{ runner.temp }}/mochios-rust-sdk
+      - name: Check signing approval policy using the read-only job token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HELPER: ${{ steps.sdk.outputs.helper }}
+          RELEASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 -I - "$HELPER" "$GITHUB_REPOSITORY" "$RELEASE_BRANCH" <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path(sys.argv[1]).parent))
+          import release
+          release.approval_policy(sys.argv[2], 'app-release', 17892808, sys.argv[3])
+          print('Environment Team and branch protection verified')
+          PY
       - name: Test, compile and stage Edit
         env:
           SDK: ${{ steps.sdk.outputs.sdk }}
@@ -73,7 +90,7 @@ jobs:
           path: unsigned-package
       - name: Prepare trusted tooling without checking out application code
         id: sdk
-        uses: mochiOS/devkit/actions/setup-rust-sdk@1ae906d7417e9882b11541e338552c3039c981fb
+        uses: mochiOS/devkit/actions/setup-rust-sdk@0f8585fc13691383bebe304633dae8bced8443d1
         with:
           output: ${{ runner.temp }}/mochios-rust-sdk
       - name: Build the pinned signing tool
@@ -84,9 +101,7 @@ jobs:
       - name: Sign, verify and publish the approved package
         env:
           GH_TOKEN: ${{ github.token }}
-          MSIGN_CERTIFICATE_B64: ${{ secrets.MSIGN_CERTIFICATE_B64 }}
-          MSIGN_PRIVATE_KEY_B64: ${{ secrets.MSIGN_PRIVATE_KEY_B64 }}
-          MSIGN_ROOT_PUBLIC_KEY_B64: ${{ vars.MSIGN_ROOT_PUBLIC_KEY_B64 }}
+          MSIGN_IDENTITY_B64: ${{ secrets.MSIGN_IDENTITY_B64 }}
           HELPER: ${{ steps.sdk.outputs.helper }}
           SOURCE_COMMIT: ${{ github.sha }}
           RELEASE_REPOSITORY: ${{ github.repository }}
@@ -97,7 +112,7 @@ jobs:
             --msign "$RUNNER_TEMP/host-tools/release/msign" \
             --package-id org.mochios.edit \
             --commit "$SOURCE_COMMIT" \
-            --sdk-ref 1ae906d7417e9882b11541e338552c3039c981fb \
+            --sdk-ref 0f8585fc13691383bebe304633dae8bced8443d1 \
             --repository "$RELEASE_REPOSITORY" \
             --environment app-release \
             --reviewer-team 17892808 \
