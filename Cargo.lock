@@ -1054,6 +1054,7 @@ dependencies = [
  "mochios-capability-protocol",
  "mochios-package-manifest",
  "mochios-workspace-protocol",
+ "zeroize",
 ]
 
 [[package]]
@@ -1091,6 +1092,7 @@ version = "0.1.0"
 [[package]]
 name = "mochios-fonts"
 version = "0.1.0"
+source = "git+https://github.com/mochiOS/fonts?rev=233cb947ed6b10e175b0c6570611eb5605f112e1#233cb947ed6b10e175b0c6570611eb5605f112e1"
 dependencies = [
  "sha2",
  "ttf-parser",
@@ -2430,9 +2432,9 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ui_layout"
-version = "0.9.8"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe00a83f195b147e7ea8a2b9abc08b9b3ca043e7fcca996bd7a980174438fb1b"
+checksum = "afbdfab90b0052416a13fa78be0f151f5bb6480242601b97e76207f58e8761b0"
 
 [[package]]
 name = "unicode-bidi"
@@ -3292,15 +3294,43 @@ name = "mboot-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "mnu"
-version = "0.1.0"
+name = "rustc-std-workspace-alloc"
+version = "1.99.0"
 
 [[patch.unused]]
-name = "mochios-mdriver-protocol"
+name = "rustc-std-workspace-core"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "rustc-std-workspace-std"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "mochi-user-newlib-runtime"
 version = "0.1.0"
 
 [[patch.unused]]
 name = "mochi-user-runtime"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-certificate"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-certificate-database"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-driver-control-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-elf-signature"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-http-client"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -3312,11 +3342,31 @@ name = "mochios-linux-portal-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "mochios-network-stack"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-package-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-package-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "mochios-signature-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "mochios-test-support"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "mochios-tls-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-tls-stream-ffi"
 version = "0.1.0"
 
 [[patch.unused]]
