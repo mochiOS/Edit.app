@@ -1,0 +1,57 @@
+name: Build native Edit MPKG
+on:
+  push:
+    branches: [staging, main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: edit-package-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '4'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libfontconfig1-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev unzip curl perl cmake
+      - name: Prepare the pinned standalone Rust SDK
+        id: sdk
+        uses: mochiOS/devkit/actions/setup-rust-sdk@c978f59725ab4995daa9e0df9b2df8b7d30e7182
+        with:
+          output: ${{ runner.temp }}/mochios-rust-sdk
+      - name: Test, compile and stage Edit
+        env:
+          SDK: ${{ steps.sdk.outputs.sdk }}
+          HELPER: ${{ steps.sdk.outputs.helper }}
+        run: python3 "$HELPER" --source "$GITHUB_WORKSPACE" --sdk "$SDK" --output "$RUNNER_TEMP/app-build" --test
+      - name: Build unsigned MPKG using the public Action
+        id: package
+        uses: mochiOS/devkit/actions/build-mpkg@20d3fb71b952ae7a4ff583dafe8cc3d00e24d3a3
+        with:
+          manifest: ${{ runner.temp }}/app-build/stage/manifest.toml
+          payload: ${{ runner.temp }}/app-build/stage/payload
+          output: dist/Edit.mpkg
+      - name: Retain package and reviewable dependency resolution
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: edit-unsigned-mpkg
+          path: |
+            ${{ steps.package.outputs.package }}
+            ${{ steps.package.outputs.checksum-file }}
+            ${{ runner.temp }}/app-build/build-info.json
+            ${{ runner.temp }}/app-build/resolved.Cargo.lock
+          if-no-files-found: error
+          retention-days: 14
