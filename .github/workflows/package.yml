@@ -29,7 +29,7 @@ jobs:
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libfontconfig1-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev unzip curl perl cmake
       - name: Prepare the pinned standalone Rust SDK
         id: sdk
-        uses: mochiOS/devkit/actions/setup-rust-sdk@9fbeaeaaeb8dcb597b662fe0cdc8df145d065395
+        uses: mochiOS/devkit/actions/setup-rust-sdk@1ae906d7417e9882b11541e338552c3039c981fb
         with:
           output: ${{ runner.temp }}/mochios-rust-sdk
       - name: Test, compile and stage Edit
@@ -56,3 +56,49 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+  publish:
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.APP_RELEASE_ENABLED == 'true'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: app-release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download this run's verified build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: edit-unsigned-mpkg
+          path: unsigned-package
+      - name: Prepare trusted tooling without checking out application code
+        id: sdk
+        uses: mochiOS/devkit/actions/setup-rust-sdk@1ae906d7417e9882b11541e338552c3039c981fb
+        with:
+          output: ${{ runner.temp }}/mochios-rust-sdk
+      - name: Build the pinned signing tool
+        env:
+          SDK: ${{ steps.sdk.outputs.sdk }}
+          HELPER: ${{ steps.sdk.outputs.helper }}
+        run: python3 "$(dirname "$HELPER")/host-tool.py" --sdk "$SDK" --tool msign --output "$RUNNER_TEMP/host-tools"
+      - name: Sign, verify and publish the approved package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MSIGN_CERTIFICATE_B64: ${{ secrets.MSIGN_CERTIFICATE_B64 }}
+          MSIGN_PRIVATE_KEY_B64: ${{ secrets.MSIGN_PRIVATE_KEY_B64 }}
+          MSIGN_ROOT_PUBLIC_KEY_B64: ${{ vars.MSIGN_ROOT_PUBLIC_KEY_B64 }}
+          HELPER: ${{ steps.sdk.outputs.helper }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 "$(dirname "$HELPER")/release.py" \
+            --artifacts "$GITHUB_WORKSPACE/unsigned-package" \
+            --msign "$RUNNER_TEMP/host-tools/release/msign" \
+            --package-id org.mochios.edit \
+            --commit "$SOURCE_COMMIT" \
+            --sdk-ref 1ae906d7417e9882b11541e338552c3039c981fb \
+            --repository "$RELEASE_REPOSITORY" \
+            --environment app-release \
+            --reviewer-team 17892808 \
+            --branch "$RELEASE_BRANCH"
