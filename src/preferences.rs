@@ -30,6 +30,18 @@ impl Default for EditorPreferences {
 }
 
 impl EditorPreferences {
+    #[cfg(target_os = "mochios")]
+    pub(crate) fn load() -> Self {
+        appcore::ApplicationData::open()
+            .and_then(|data| data.read("preferences.conf", 16 * 1024))
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|text| Self::parse(&text))
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(target_os = "mochios"))]
     pub(crate) fn load() -> Self {
         let Some(path) = storage_path() else {
             return Self::default();
@@ -41,6 +53,12 @@ impl EditorPreferences {
             .unwrap_or_default()
     }
 
+    #[cfg(target_os = "mochios")]
+    pub(crate) fn save(&self) -> io::Result<()> {
+        appcore::ApplicationData::open()?.write("preferences.conf", self.encode().as_bytes())
+    }
+
+    #[cfg(not(target_os = "mochios"))]
     pub(crate) fn save(&self) -> io::Result<()> {
         let path = storage_path().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid session user name")
